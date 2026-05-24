@@ -79,9 +79,15 @@ class SchedulerPPMixin:
                 self.last_batch = self.last_mbs[mb_id]
                 next_first_rank_mb_id = (mb_id + self.ps.pp_size) % self.pp_loop_size
                 next_mb_id = (mb_id + 1) % self.pp_loop_size
+
+                ## managers/scheduler_components/request_receiver.py:87
+                # pp_rank == 0：从tokenizer/RPC socket 收请求
+                # pp_rank > 0： 从前一个pp rank 收请求，收到后并broadcast 给本stage 内其他TP rank
+
                 with torch.profiler.record_function("recv_requests"):
                     recv_reqs = self.request_receiver.recv_requests()
                     self.process_input_requests(recv_reqs)
+
                 if not self.pp_group.is_last_rank:
                     self._pp_commit_comm_work(self.send_req_work)
                     with torch.profiler.record_function("send_reqs_to_next_stage"):
@@ -91,14 +97,18 @@ class SchedulerPPMixin:
                         )
                 with torch.profiler.record_function("get_next_batch_to_run"):
                     self.mbs[mb_id] = self.get_next_batch_to_run()
+
+                # 调度过程中可能修改self.running_batch，所以调度完要写回
                 self.running_mbs[mb_id] = self.running_batch
                 self.cur_batch: Optional[ScheduleBatch] = self.mbs[mb_id]
                 if self.cur_batch:
                     server_is_idle = False
                     pp_proxy_tensors = self._pp_recv_proxy_tensors()
+
                 next_pp_outputs = None
                 next_batch_result = None
                 d2h_event = None
+
                 if self.server_args.pp_async_batch_depth > 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -106,6 +116,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+
                 self._pp_commit_comm_work(self.send_proxy_work)
                 if self.cur_batch:
                     result, self.launch_event = self._pp_launch_batch(
@@ -114,6 +125,7 @@ class SchedulerPPMixin:
                         self.mb_metadata,
                         self.last_rank_comm_queue,
                     )
+
                 if self.server_args.pp_async_batch_depth == 0:
                     next_pp_outputs, next_batch_result, d2h_event = (
                         self._pp_commit_send_output_work_and_preprocess_output_tensors(
@@ -121,6 +133,7 @@ class SchedulerPPMixin:
                             next_mb_id,
                         )
                     )
+
                 if self.mbs[next_mb_id] is not None:
                     d2h_event.synchronize()
                     with torch.profiler.record_function("process_batch_result"):
@@ -129,6 +142,7 @@ class SchedulerPPMixin:
                             next_batch_result,
                         )
                     self.last_mbs[next_mb_id] = self.mbs[next_mb_id]
+
                 if not self.pp_group.is_last_rank:
                     if self.cur_batch:
                         self.device_module.current_stream().wait_event(

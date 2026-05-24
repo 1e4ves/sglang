@@ -327,9 +327,9 @@ class MQALayer(nn.Module):
             **({} if _FP8_WO_A_GEMM else {"params_dtype": torch.bfloat16}),
         )
         if _FP8_WO_A_GEMM:
-            assert hasattr(
-                self.wo_a, "weight_scale_inv"
-            ), "FP8 quant_config must create weight_scale_inv"
+            assert hasattr(self.wo_a, "weight_scale_inv"), (
+                "FP8 quant_config must create weight_scale_inv"
+            )
             self.wo_a.weight_scale_inv.format_ue8m0 = True
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank,
@@ -549,9 +549,9 @@ class MQALayer(nn.Module):
         forward_batch: ForwardBatch,
     ) -> torch.Tensor:
         if not get_attn_tp_context().input_scattered and x.shape[0] == 0:
-            assert (
-                not self.wo_b.reduce_results
-            ), "short-circuiting allreduce will lead to hangs"
+            assert not self.wo_b.reduce_results, (
+                "short-circuiting allreduce will lead to hangs"
+            )
             return x
 
         attn_backend = forward_batch.attn_backend
@@ -1043,6 +1043,10 @@ class DeepseekV4Model(nn.Module):
             if self.pp_group.is_first_rank:
                 hidden_states = cp_split_and_rebuild_data(forward_batch, hidden_states)
             positions = cp_split_and_rebuild_position(forward_batch, positions)
+
+        # Upgrade lazy raw metadata on the main stream once before any layer
+        # forks alt-streams; later per-layer calls become no-ops.
+        forward_batch.attn_backend._maybe_upgrade_forward_metadata()
 
         for i in range(self.start_layer, self.end_layer):
             layer = self.layers[i]
@@ -1549,9 +1553,9 @@ class DeepseekV4ForCausalLM(nn.Module):
                                 )
                                 bucket = cache_wqkv_a_weight.setdefault(param_name, {})
                                 shard_key = "q" if is_q else "kv"
-                                assert (
-                                    shard_key not in bucket
-                                ), f"duplicate shard {shard_key} for {param_name}"
+                                assert shard_key not in bucket, (
+                                    f"duplicate shard {shard_key} for {param_name}"
+                                )
                                 bucket[shard_key] = loaded_weight
                                 if len(bucket) == 2:
                                     fused_weight = torch.cat(
@@ -1655,9 +1659,9 @@ EntryClass = [DeepseekV4ForCausalLM]
 def _dequant_fp8(weight: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     from einops import rearrange
 
-    assert (
-        weight.dtype == torch.float8_e4m3fn
-    ), f"expected fp8_e4m3fn, got {weight.dtype}"
+    assert weight.dtype == torch.float8_e4m3fn, (
+        f"expected fp8_e4m3fn, got {weight.dtype}"
+    )
     assert scale.dtype in (
         torch.float8_e8m0fnu,
         torch.float32,
