@@ -363,7 +363,12 @@ class FullComponent(TreeComponent):
 
         # LOAD: every tail page gets fresh device slots (plain alloc; load-back
         # copies by content, so no page continuity with the prefix is required).
-        slots = self._full_allocator().alloc(len(keys) * self.cache.page_size)
+        allocator = self._full_allocator()
+        num_tokens = len(keys) * self.cache.page_size
+        shortfall = max(0, num_tokens - allocator.available_size())
+        if shortfall:
+            self.cache.evict(EvictParams(num_tokens=shortfall))
+        slots = allocator.alloc(num_tokens)
         if slots is None:
             return None
         return PoolTransfer(

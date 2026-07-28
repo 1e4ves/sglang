@@ -206,14 +206,22 @@ class UnifiedCacheConnectorMixin:
                 break
             component_transfers.append((component, transfer))
 
-        # Trigger connector load
-        full = component_transfers[0][1] if component_transfers else None
-        assert full is not None and full.name == PoolName.KV
+        prefix_len = device_hit_len + num_tokens
+        if len(component_transfers) != len(self._components_tuple):
+            if component_transfers:
+                full = component_transfers[0][1]
+                for component, transfer in component_transfers:
+                    component.finish_connector_load(
+                        req, full, transfer, prefix_len, False
+                    )
+            return empty, req.last_node
+
+        full = component_transfers[0][1]
+        assert full.name == PoolName.KV
 
         transfers = [transfer for _, transfer in component_transfers]
         success = self.connector.load(req.rid, transfers)
         success = self._connector_sync_success(success)
-        prefix_len = device_hit_len + num_tokens
         for component, transfer in component_transfers:
             component.finish_connector_load(req, full, transfer, prefix_len, success)
         if not success:

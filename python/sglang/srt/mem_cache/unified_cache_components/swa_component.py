@@ -754,6 +754,9 @@ class SWAComponent(TreeComponent):
         if phase == ConnectorTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
+            shortfall = max(0, num_tokens - allocator.available_size())
+            if shortfall:
+                self.cache.evict(EvictParams(swa_num_tokens=shortfall))
             transfer.device_indices = allocator.alloc(num_tokens)
             if transfer.device_indices is None:
                 return None

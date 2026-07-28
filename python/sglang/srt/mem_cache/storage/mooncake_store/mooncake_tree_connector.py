@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from concurrent.futures import ThreadPoolExecutor, wait
 from dataclasses import replace
 from typing import Any, Sequence
 
@@ -27,12 +28,18 @@ class _LogicalPool:
         self.kv_buffer = None
 
 
-class _PageRowsPool:
-    """Direct view of tensors whose first dimension stores logical pages."""
+class _TokenRowsPool:
+    """Direct view of tensors whose first dimension stores token slots."""
 
     def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
         self.kv_buffer = list(buffers)
         self.page_size = page_size
+        self._page_offsets = torch.arange(page_size)
+        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
+        self._row_sizes = tuple(
+            buffer[0].numel() * buffer.element_size() * page_size
+            for buffer in self.kv_buffer
+        )
 
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
@@ -44,27 +51,89 @@ class _PageRowsPool:
                 f"Mooncake transfer has {slots.numel()} indices, expected a "
                 f"multiple of page_size={self.page_size}."
             )
+        if not slots.numel():
+            return [], []
 
-        ptrs = []
-        sizes = []
-        for page_slots in slots.reshape(-1, self.page_size):
-            first = int(page_slots[0])
-            expected = torch.arange(first, first + self.page_size)
-            if first % self.page_size or not torch.equal(page_slots, expected):
-                raise ValueError(
-                    "Direct Mooncake requires aligned contiguous device pages."
-                )
-            row = first // self.page_size
-            for buffer in self.kv_buffer:
-                if row >= buffer.shape[0]:
-                    raise ValueError(
-                        f"Mooncake page row {row} exceeds buffer shape "
-                        f"{tuple(buffer.shape)}."
-                    )
-                value = buffer[row]
-                ptrs.append(value.data_ptr())
-                sizes.append(value.numel() * value.element_size())
-        return ptrs, sizes
+        pages = slots.reshape(-1, self.page_size)
+        starts = pages[:, 0]
+        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
+            pages, starts[:, None] + self._page_offsets
+        ):
+            raise ValueError(
+                "Direct Mooncake requires aligned contiguous device pages."
+            )
+        first_row = int(starts.min())
+        last_row = int(starts.max()) + self.page_size
+        if first_row < 0 or last_row > self._row_count:
+            bad_row = first_row if first_row < 0 else last_row - 1
+            raise ValueError(
+                f"Mooncake token row {bad_row} exceeds buffer shapes "
+                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
+            )
+
+        ptrs = [
+            buffer[int(start)].data_ptr()
+            for start in starts.tolist()
+            for buffer in self.kv_buffer
+        ]
+        return ptrs, list(self._row_sizes) * len(starts)
+
+
+class _PageRowsPool:
+    """Direct view of tensors whose first dimension stores logical pages."""
+
+    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+        self.kv_buffer = list(buffers)
+        self.page_size = page_size
+        self._page_offsets = torch.arange(page_size)
+        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
+        self._row_sizes = tuple(
+            buffer.shape[1:].numel() * buffer.element_size()
+            for buffer in self.kv_buffer
+        )
+        self._row_ptrs = tuple(
+            tuple(
+                buffer.data_ptr() + row * buffer.stride(0) * buffer.element_size()
+                for buffer in self.kv_buffer
+            )
+            for row in range(self._row_count)
+        )
+
+    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
+        return self.kv_buffer
+
+    def get_page_buffer_meta(self, indices: torch.Tensor):
+        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
+        if slots.numel() % self.page_size:
+            raise ValueError(
+                f"Mooncake transfer has {slots.numel()} indices, expected a "
+                f"multiple of page_size={self.page_size}."
+            )
+        if not slots.numel():
+            return [], []
+
+        pages = slots.reshape(-1, self.page_size)
+        starts = pages[:, 0]
+        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
+            pages, starts[:, None] + self._page_offsets
+        ):
+            raise ValueError(
+                "Direct Mooncake requires aligned contiguous device pages."
+            )
+
+        rows = starts.div(self.page_size, rounding_mode="floor")
+        first_row = int(rows.min())
+        last_row = int(rows.max())
+        if first_row < 0 or last_row >= self._row_count:
+            bad_row = first_row if first_row < 0 else last_row
+            raise ValueError(
+                f"Mooncake page row {bad_row} exceeds buffer shapes "
+                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
+            )
+
+        row_indices = rows.tolist()
+        ptrs = [ptr for row in row_indices for ptr in self._row_ptrs[row]]
+        return ptrs, list(self._row_sizes) * len(row_indices)
 
 
 def _state_page_views(pools: Sequence[Any], name: PoolName) -> list[torch.Tensor]:
@@ -158,6 +227,39 @@ def _build_dsv4_pools(kvcache: Any, page_size: int):
     return _LogicalPool(page_size), pools, sources
 
 
+def _build_pools(kvcache: Any, page_size: int):
+    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
+        DeepSeekV4TokenToKVPool,
+    )
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    if isinstance(kvcache, DeepSeekV4TokenToKVPool):
+        return _build_dsv4_pools(kvcache, page_size)
+    if not isinstance(kvcache, DSATokenToKVPool):
+        raise ValueError(
+            "Direct Mooncake connector currently supports standard DSA and "
+            "DeepSeek V4 KV pools only."
+        )
+    if kvcache.page_size != page_size:
+        raise ValueError(
+            "DSA KV page size must match the tree page size: "
+            f"{kvcache.page_size} != {page_size}."
+        )
+
+    pools = {
+        PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
+        PoolName.INDEXER: _PageRowsPool(kvcache.index_k_with_scale_buffer, page_size),
+    }
+    return (
+        _LogicalPool(page_size),
+        pools,
+        {
+            PoolName.KV: PoolName.KV,
+            PoolName.INDEXER: PoolName.KV,
+        },
+    )
+
+
 class MooncakeTreeConnector(UnifiedTreeConnector):
     def __init__(
         self,
@@ -168,7 +270,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        anchor, self.pools, self.sources = _build_dsv4_pools(kvcache, self.page_size)
+        anchor, self.pools, self.sources = _build_pools(kvcache, self.page_size)
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -204,6 +306,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         )
         self._stats = {"lookup": 0, "load": 0, "offload": 0}
         self._register_buffers()
+        self._load_executor = ThreadPoolExecutor(
+            max_workers=len(self.pools), thread_name_prefix="mooncake-get"
+        )
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -268,9 +373,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             for transfer in transfers
         )
 
-    def _page_exists(
-        self, page_keys: list[str], transfer: PoolTransfer
-    ) -> list[bool]:
+    def _page_exists(self, page_keys: list[str], transfer: PoolTransfer) -> list[bool]:
         """Per-page presence of one pool's objects over the whole candidate range."""
         component_keys, multiplier = self.storage._get_hybrid_page_component_keys(
             page_keys, transfer
@@ -325,8 +428,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             end
             for end in range(1, limit + 1)
             if all(
-                counts[end] - counts[max(0, end - window)]
-                == end - max(0, end - window)
+                counts[end] - counts[max(0, end - window)] == end - max(0, end - window)
                 for window, counts in windows
             )
         ]
@@ -344,7 +446,14 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self._expand(transfers)
         if not expanded:
             return False
-        results = self.storage.batch_get_v2(expanded)
+        futures = [
+            self._load_executor.submit(self.storage.batch_get_v2, [transfer])
+            for transfer in expanded
+        ]
+        wait(futures)
+        results = {}
+        for future in futures:
+            results.update(future.result())
         if not self._all_succeeded(results, expanded):
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
@@ -383,4 +492,5 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
     def close(self) -> None:
         logger.info("Unified tree Mooncake stats: %s", self._stats)
+        self._load_executor.shutdown(wait=True)
         self.storage.close()
