@@ -45,6 +45,7 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
+    ConnectorTransferPhase,
     EvictLayer,
     FullComponent,
     LRURefreshPhase,
@@ -53,9 +54,14 @@ from sglang.srt.mem_cache.unified_cache_components import (
     TreeComponent,
     get_and_increase_time_counter,
 )
+from sglang.srt.mem_cache.unified_cache_connector_mixin import (
+    UnifiedCacheConnectorMixin,
+    UnifiedTreeConnector,
+)
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
+    get_hash_str,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -103,6 +109,9 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        # Whether this node has been (or is being) offloaded to an external
+        # connector, to avoid re-offloading on repeated hits.
+        self.connector_offloaded: bool = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -304,7 +313,7 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
+class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -378,6 +387,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+
+        self.connector: Optional["UnifiedTreeConnector"] = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -481,6 +492,8 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
+        self._reset_connector_state()
+
         if self.cache_controller is not None:
             self.cache_controller.reset()
             self.cache_controller.mem_pool_host.clear()
@@ -570,6 +583,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
+        self._close_connector()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -592,13 +606,17 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             best_match_device_node,
             best_match_device_value_len,
         ) = self._match_prefix_helper(key)
-        return self._match_post_processor(
+        result = self._match_post_processor(
             params,
             value,
             best_match_node,
             best_match_device_node,
             best_match_device_value_len,
         )
+
+        if self.connector is not None and params.req is not None:
+            result = self._match_connector(key, params.req, result)
+        return result
 
     def insert(self, params: InsertParams) -> InsertResult:
         if self.disable:
@@ -858,12 +876,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert (
-            req.cache_protected_len <= len(new_indices) + self.page_size - 1
-        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        assert new_prefix_len <= len(
-            new_indices
-        ), f"{new_prefix_len=}, {len(new_indices)=}"
+        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
+            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        )
+        assert new_prefix_len <= len(new_indices), (
+            f"{new_prefix_len=}, {len(new_indices)=}"
+        )
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -1036,6 +1054,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        # Prefix fragment inherits offloaded state: its pages were already part
+        # of the child's offload, so no need to re-offload.
+        new_node.connector_offloaded = child.connector_offloaded
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1085,7 +1106,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage:
+        if self.enable_storage or self.connector is not None:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)
@@ -1206,7 +1227,9 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
                 )
 
         if is_new_leaf:
-            self._inc_hit_count(target_node, params.chunked)
+            while target_node is not node:
+                self._inc_hit_count(target_node, params.chunked)
+                target_node = target_node.parent
         return result
 
     def _insert_helper_host(
@@ -1827,6 +1850,12 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
             and node.hit_count >= self.write_through_threshold
         ):
             self.write_backup(node)
+        elif (
+            self.connector is not None
+            and not node.connector_offloaded
+            and node.hit_count >= self.write_through_threshold
+        ):
+            self._offload_connector_node(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         if (
@@ -2160,6 +2189,7 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        self._release_connector_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -2530,6 +2560,13 @@ class UnifiedRadixCache(KVCacheEventMixin, BasePrefixCache):
     ) -> tuple[torch.Tensor, UnifiedTreeNode]:
         """Prepare KV cache loading from host to device.
         Returns (device_indices, last_node) tuple."""
+        if (
+            self.connector is not None
+            and params.req is not None
+            and params.req.rid in self._connector_markers
+        ):
+            return self._load_connector(params.req)
+
         best_match_node = params.best_match_node
         mem_quota = params.mem_quota
         req = params.req

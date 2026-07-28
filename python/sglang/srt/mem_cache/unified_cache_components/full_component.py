@@ -21,6 +21,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
+    ConnectorTransferPhase,
     EvictLayer,
     TreeComponent,
 )
@@ -331,3 +332,53 @@ class FullComponent(TreeComponent):
                 self.cache._update_evictable_leaf_sets(n)
 
             self.cache._update_evictable_leaf_sets(node)
+
+    def _full_allocator(self):
+        allocator = self.cache.token_to_kv_pool_allocator
+        return getattr(allocator, "full_attn_allocator", allocator)
+
+    def build_connector_transfer(
+        self,
+        phase: ConnectorTransferPhase,
+        *,
+        node: Optional[UnifiedTreeNode] = None,
+        keys: Optional[Sequence[str]] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ConnectorTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            return PoolTransfer(
+                name=PoolName.KV,
+                device_indices=value.to(torch.int64),
+                keys=list(node.hash_value),
+            )
+
+        if not keys:
+            return None
+        if phase == ConnectorTransferPhase.LOOKUP:
+            return PoolTransfer(name=PoolName.KV, keys=list(keys))
+
+        # LOAD: every tail page gets fresh device slots (plain alloc; load-back
+        # copies by content, so no page continuity with the prefix is required).
+        slots = self._full_allocator().alloc(len(keys) * self.cache.page_size)
+        if slots is None:
+            return None
+        return PoolTransfer(
+            name=PoolName.KV,
+            device_indices=slots.to(torch.int64),
+            keys=list(keys),
+        )
+
+    def finish_connector_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        if not success:
+            self._full_allocator().free(transfer.device_indices)

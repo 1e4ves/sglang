@@ -83,6 +83,12 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
+class ConnectorTransferPhase(str, Enum):
+    LOOKUP = "lookup"
+    LOAD = "load"
+    OFFLOAD = "offload"
+
+
 class LRURefreshPhase(str, Enum):
 
     WALKDOWN = "walkdown"  # touching a node while walking through the tree
@@ -393,6 +399,31 @@ class TreeComponent(ABC):
         """Build transfer descriptors for this component in the given phase.
         Returns None if the component has nothing to transfer."""
         return None
+
+    def build_connector_transfer(
+        self,
+        phase: ConnectorTransferPhase,
+        *,
+        node: Optional[UnifiedTreeNode] = None,
+        keys: Optional[Sequence[str]] = None,
+    ) -> Optional[PoolTransfer]:
+        """Build this component's direct device/storage transfer.
+
+        For LOOKUP / LOAD, ``keys`` are the per-page hashes of the
+        device-uncached tail (page 0 is the first uncached page).
+        """
+        return None
+
+    def finish_connector_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        """Commit a loaded sidecar, or release it after a failed load."""
+        pass
 
     def commit_hicache_transfer(
         self,

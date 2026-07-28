@@ -2495,6 +2495,11 @@ class ServerArgs:
     enable_hierarchical_cache: A[bool, "Enable hierarchical cache", NS("memory")] = (
         False
     )
+    enable_unified_tree_connector: A[
+        bool,
+        "Enable direct external storage through UnifiedRadixCache without a host cache tier.",
+        NS("memory"),
+    ] = False
     hicache_ratio: A[
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",
@@ -6706,6 +6711,19 @@ class ServerArgs:
         1) Layout <-> I/O compatibility for direct conflicts.
         2) Storage <-> layout compatibility (may rewrite layout).
         """
+        if self.enable_unified_tree_connector:
+            if self.enable_hierarchical_cache:
+                raise ValueError(
+                    "--enable-unified-tree-connector and "
+                    "--enable-hierarchical-cache are mutually exclusive."
+                )
+            if self.hicache_storage_backend is not None:
+                raise ValueError(
+                    "--enable-unified-tree-connector does not use "
+                    "--hicache-storage-backend."
+                )
+            return
+
         # Skip all normalization when neither hicache nor decode-offload path is active.
         if not (
             self.enable_hierarchical_cache
