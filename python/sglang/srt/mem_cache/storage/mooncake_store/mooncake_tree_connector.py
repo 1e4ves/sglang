@@ -1,16 +1,17 @@
 from __future__ import annotations
 
 import logging
-from concurrent.futures import ThreadPoolExecutor, wait
-from dataclasses import replace
-from typing import Any, Sequence
+import threading
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
+from queue import Queue
+from typing import Any
 
 import torch
 
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
-    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -22,29 +23,47 @@ from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnec
 logger = logging.getLogger(__name__)
 
 
+def _prefix_offsets(sizes: Sequence[int]) -> tuple[int, ...]:
+    offsets = []
+    current = 0
+    for size in sizes:
+        offsets.append(current)
+        current += size
+    return tuple(offsets)
+
+
 class _LogicalPool:
     def __init__(self, page_size: int):
         self.page_size = page_size
         self.kv_buffer = None
 
 
-class _TokenRowsPool:
-    """Direct view of tensors whose first dimension stores token slots."""
-
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+class _LayerRowsPool:
+    def __init__(
+        self,
+        buffers: Sequence[torch.Tensor],
+        page_size: int,
+        *,
+        rows_are_pages: bool,
+    ):
+        if not buffers:
+            raise ValueError("Direct Mooncake requires at least one layer buffer.")
         self.kv_buffer = list(buffers)
         self.page_size = page_size
         self._page_offsets = torch.arange(page_size)
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
+        self._row_span = 1 if rows_are_pages else page_size
+        self._rows_are_pages = rows_are_pages
         self._row_sizes = tuple(
-            buffer[0].numel() * buffer.element_size() * page_size
+            buffer[0].numel() * buffer.element_size() * self._row_span
             for buffer in self.kv_buffer
         )
+        self._layer_offsets = _prefix_offsets(self._row_sizes)
 
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
 
-    def get_page_buffer_meta(self, indices: torch.Tensor):
+    def _rows(self, indices: torch.Tensor) -> torch.Tensor:
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
         if slots.numel() % self.page_size:
             raise ValueError(
@@ -52,7 +71,7 @@ class _TokenRowsPool:
                 f"multiple of page_size={self.page_size}."
             )
         if not slots.numel():
-            return [], []
+            return torch.empty((0,), dtype=torch.int64)
 
         pages = slots.reshape(-1, self.page_size)
         starts = pages[:, 0]
@@ -62,183 +81,56 @@ class _TokenRowsPool:
             raise ValueError(
                 "Direct Mooncake requires aligned contiguous device pages."
             )
-        first_row = int(starts.min())
-        last_row = int(starts.max()) + self.page_size
+
+        rows = (
+            starts.div(self.page_size, rounding_mode="floor")
+            if self._rows_are_pages
+            else starts
+        )
+        first_row = int(rows.min())
+        last_row = int(rows.max()) + self._row_span
         if first_row < 0 or last_row > self._row_count:
             bad_row = first_row if first_row < 0 else last_row - 1
             raise ValueError(
-                f"Mooncake token row {bad_row} exceeds buffer shapes "
+                f"Mooncake row {bad_row} exceeds buffer shapes "
                 f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
             )
-
-        ptrs = [
-            buffer[int(start)].data_ptr()
-            for start in starts.tolist()
-            for buffer in self.kv_buffer
-        ]
-        return ptrs, list(self._row_sizes) * len(starts)
-
-
-class _PageRowsPool:
-    """Direct view of tensors whose first dimension stores logical pages."""
-
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
-        self.kv_buffer = list(buffers)
-        self.page_size = page_size
-        self._page_offsets = torch.arange(page_size)
-        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
-        self._row_sizes = tuple(
-            buffer.shape[1:].numel() * buffer.element_size()
-            for buffer in self.kv_buffer
-        )
-        self._row_ptrs = tuple(
-            tuple(
-                buffer.data_ptr() + row * buffer.stride(0) * buffer.element_size()
-                for buffer in self.kv_buffer
-            )
-            for row in range(self._row_count)
-        )
-
-    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
-        return self.kv_buffer
+        return rows
 
     def get_page_buffer_meta(self, indices: torch.Tensor):
-        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
-            raise ValueError(
-                f"Mooncake transfer has {slots.numel()} indices, expected a "
-                f"multiple of page_size={self.page_size}."
-            )
-        if not slots.numel():
-            return [], []
+        rows = self._rows(indices).tolist()
+        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
+        return ptrs, list(self._row_sizes) * len(rows)
 
-        pages = slots.reshape(-1, self.page_size)
-        starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
-        ):
-            raise ValueError(
-                "Direct Mooncake requires aligned contiguous device pages."
-            )
+    def prepare_locations(self, indices: torch.Tensor) -> list[int]:
+        return self._rows(indices).tolist()
 
-        rows = starts.div(self.page_size, rounding_mode="floor")
-        first_row = int(rows.min())
-        last_row = int(rows.max())
-        if first_row < 0 or last_row >= self._row_count:
-            bad_row = first_row if first_row < 0 else last_row
-            raise ValueError(
-                f"Mooncake page row {bad_row} exceeds buffer shapes "
-                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
-            )
-
-        row_indices = rows.tolist()
-        ptrs = [ptr for row in row_indices for ptr in self._row_ptrs[row]]
-        return ptrs, list(self._row_sizes) * len(row_indices)
-
-
-def _state_page_views(pools: Sequence[Any], name: PoolName) -> list[torch.Tensor]:
-    views = []
-    for pool in pools:
-        if pool is None:
-            raise ValueError(f"DeepSeek V4 pool {name} has a missing state pool.")
-        state = pool.kv_score_buffer.kv_score
-        ring_size = int(pool.ring_size)
-        usable = state.shape[0] // ring_size * ring_size
-        views.append(
-            state.view(torch.uint8)
-            .reshape(state.shape[0], -1)[:usable]
-            .reshape(usable // ring_size, -1)
-        )
-    return views
-
-
-def _build_dsv4_pools(kvcache: Any, page_size: int):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4TokenToKVPool,
-        HiSparseC4DevicePool,
-    )
-
-    if not isinstance(kvcache, DeepSeekV4TokenToKVPool):
-        raise ValueError(
-            "Direct Mooncake connector currently supports DeepSeek V4 KV pools only."
-        )
-    if kvcache._unified_kv:
-        raise ValueError(
-            "Direct Mooncake connector does not support DeepSeek V4 unified-KV layout."
-        )
-    if isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
-        raise ValueError(
-            "Direct Mooncake connector does not support DeepSeek V4 HiSparse."
-        )
-    if kvcache.swa_page_size != page_size:
-        raise ValueError(
-            "DeepSeek V4 SWA page size must match the tree page size: "
-            f"{kvcache.swa_page_size} != {page_size}."
+    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
+        size = self._row_sizes[layer]
+        offset = self._layer_offsets[layer]
+        return (
+            [[self.kv_buffer[layer][row].data_ptr()] for row in locations],
+            [[size] for _ in locations],
+            [[offset] for _ in locations],
         )
 
-    mapping = kvcache.layer_mapping[kvcache._stage_start : kvcache._stage_end]
-    c4_layers = [
-        kvcache._stage_start + i
-        for i, layer in enumerate(mapping)
-        if layer.compress_ratio == 4
-    ]
-    has_c128 = any(layer.compress_ratio == 128 for layer in mapping)
 
-    pools = {
-        PoolName.SWA: _PageRowsPool(kvcache.swa_kv_pool.kv_buffer, page_size),
-    }
-    sources = {PoolName.SWA: PoolName.SWA}
+class _TokenRowsPool(_LayerRowsPool):
+    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+        super().__init__(buffers, page_size, rows_are_pages=False)
 
-    def add(name: PoolName, buffers: Sequence[torch.Tensor], source: PoolName):
-        if not buffers:
-            raise ValueError(f"DeepSeek V4 direct Mooncake requires pool {name}.")
-        pools[name] = _PageRowsPool(buffers, page_size)
-        sources[name] = source
 
-    if c4_layers:
-        add(PoolName.DEEPSEEK_V4_C4, kvcache.c4_kv_pool.kv_buffer, PoolName.KV)
-        add(
-            PoolName.DEEPSEEK_V4_C4_INDEXER,
-            kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            PoolName.KV,
-        )
-        add(
-            PoolName.DEEPSEEK_V4_C4_STATE,
-            _state_page_views(
-                [kvcache.compress_state_pools[i] for i in c4_layers],
-                PoolName.DEEPSEEK_V4_C4_STATE,
-            ),
-            PoolName.SWA,
-        )
-        add(
-            PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            _state_page_views(
-                [kvcache.indexer_compress_state_pools[i] for i in c4_layers],
-                PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
-            ),
-            PoolName.SWA,
-        )
-    if has_c128:
-        add(
-            PoolName.DEEPSEEK_V4_C128,
-            kvcache.c128_kv_pool.kv_buffer,
-            PoolName.KV,
-        )
-    return _LogicalPool(page_size), pools, sources
+class _PageRowsPool(_LayerRowsPool):
+    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
+        super().__init__(buffers, page_size, rows_are_pages=True)
 
 
 def _build_pools(kvcache: Any, page_size: int):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4TokenToKVPool,
-    )
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
-    if isinstance(kvcache, DeepSeekV4TokenToKVPool):
-        return _build_dsv4_pools(kvcache, page_size)
     if not isinstance(kvcache, DSATokenToKVPool):
-        raise ValueError(
-            "Direct Mooncake connector currently supports standard DSA and "
-            "DeepSeek V4 KV pools only."
+        raise TypeError(
+            "Direct Mooncake connector currently supports DSA KV pools only."
         )
     if kvcache.page_size != page_size:
         raise ValueError(
@@ -246,18 +138,77 @@ def _build_pools(kvcache: Any, page_size: int):
             f"{kvcache.page_size} != {page_size}."
         )
 
-    pools = {
-        PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
-        PoolName.INDEXER: _PageRowsPool(kvcache.index_k_with_scale_buffer, page_size),
-    }
     return (
         _LogicalPool(page_size),
-        pools,
         {
-            PoolName.KV: PoolName.KV,
-            PoolName.INDEXER: PoolName.KV,
+            PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
+            PoolName.INDEXER: _PageRowsPool(
+                kvcache.index_k_with_scale_buffer, page_size
+            ),
         },
     )
+
+
+class LayerWiseLoadCounter:
+    """CPU completion counter compatible with KV pools' layer wait hook."""
+
+    def __init__(self, num_layers: int):
+        self.num_layers = num_layers
+        self._producer_index = -1
+        self.consumer_index = -1
+        self._events: dict[int, list[threading.Event]] = {}
+        self._errors: dict[int, BaseException] = {}
+
+    def update_producer(self) -> int:
+        self._producer_index += 1
+        self._events[self._producer_index] = [
+            threading.Event() for _ in range(self.num_layers)
+        ]
+        return self._producer_index
+
+    def set_consumer(self, index: int) -> None:
+        self.consumer_index = index
+
+    def complete(self, index: int, layer: int) -> None:
+        self._events[index][layer].set()
+
+    def fail(self, index: int, error: BaseException) -> None:
+        events = self._events.get(index)
+        if events is None:
+            return
+        self._errors[index] = error
+        for event in events:
+            event.set()
+
+    def wait_until(self, threshold: int) -> None:
+        index = self.consumer_index
+        events = self._events.get(index)
+        if events is None:
+            return
+        events[threshold].wait()
+        error = self._errors.get(index)
+        if threshold == self.num_layers - 1:
+            self._events.pop(index, None)
+            self._errors.pop(index, None)
+        if error is not None:
+            raise RuntimeError("Mooncake layer-wise KV load failed.") from error
+
+    def reset(self) -> None:
+        self._producer_index = -1
+        self.consumer_index = -1
+        self._events.clear()
+        self._errors.clear()
+
+
+@dataclass
+class _LayerRangePlan:
+    name: PoolName
+    pool: Any
+    keys: list[str]
+    locations: list[int]
+
+    def get_layer_meta(self, layer: int):
+        return self.pool.get_prepared_layer_range_meta(self.locations, layer)
 
 
 class MooncakeTreeConnector(UnifiedTreeConnector):
@@ -270,7 +221,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        anchor, self.pools, self.sources = _build_pools(kvcache, self.page_size)
+        anchor, self.pools = _build_pools(kvcache, self.page_size)
+        self.num_layers = len(self.pools[PoolName.KV].kv_buffer)
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -304,11 +256,32 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.storage.mla_suffix = (
             f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
         )
-        self._stats = {"lookup": 0, "load": 0, "offload": 0}
+
+        self._validate_range_api()
         self._register_buffers()
-        self._load_executor = ThreadPoolExecutor(
-            max_workers=len(self.pools), thread_name_prefix="mooncake-get"
+        self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
+        self._pending: dict[str, list[PoolTransfer]] = {}
+        self._load_queue: Queue[tuple[int, list[_LayerRangePlan]] | None] = Queue()
+        self._stats = {"lookup": 0, "load": 0, "offload": 0}
+        self._load_thread = threading.Thread(
+            target=self._load_thread_func,
+            daemon=True,
+            name=f"mooncake-layerwise-tp{tp_rank}",
         )
+        self._load_thread.start()
+
+    def _validate_range_api(self) -> None:
+        required = (
+            "batch_get_session_start",
+            "batch_get_into_multi_buffer_ranges",
+            "batch_get_session_end",
+        )
+        missing = [name for name in required if not hasattr(self.storage.store, name)]
+        if missing:
+            raise RuntimeError(
+                "The installed Mooncake package lacks the layer-wise range API: "
+                + ", ".join(missing)
+            )
 
     def _register_buffers(self) -> None:
         seen = set()
@@ -326,44 +299,23 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                         f"error code: {result}."
                     )
 
-    def _expand(
-        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
-    ) -> list[PoolTransfer]:
-        by_name = {transfer.name: transfer for transfer in transfers}
-        kv = by_name.get(PoolName.KV)
+    def _expand(self, transfers: list[PoolTransfer]) -> list[PoolTransfer]:
+        kv = next(
+            (transfer for transfer in transfers if transfer.name == PoolName.KV),
+            None,
+        )
         if kv is None or not kv.keys:
             return []
-        if not allow_partial:
-            missing = set(self.sources.values()) - set(by_name)
-            if missing:
-                raise ValueError(
-                    "Mooncake transfer is missing required pools: "
-                    + ", ".join(sorted(str(name) for name in missing))
-                )
-
-        expanded = []
-        for name, source_name in self.sources.items():
-            source = by_name.get(source_name)
-            if source is None:
-                continue
-            keys = kv.keys if source_name == PoolName.KV else source.keys
-            if not keys:
-                raise ValueError(f"Mooncake transfer {name} has no keys.")
-            expanded.append(
-                replace(
-                    source,
-                    name=name,
-                    host_indices=source.device_indices,
-                    keys=list(keys),
-                    hit_policy=(
-                        PoolHitPolicy.ALL_PAGES
-                        if source_name == PoolName.KV
-                        else source.hit_policy
-                    ),
-                    indices_from_pool=None,
-                )
+        return [
+            replace(
+                kv,
+                name=name,
+                host_indices=kv.device_indices,
+                keys=list(kv.keys),
+                indices_from_pool=None,
             )
-        return expanded
+            for name in self.pools
+        ]
 
     @staticmethod
     def _all_succeeded(results: dict, transfers: list[PoolTransfer]) -> bool:
@@ -390,48 +342,18 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self._expand(transfers)
         if not expanded:
             return []
-        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        page_keys = list(kv.keys)
-        num_pages = len(page_keys)
-        if num_pages == 0:
-            return []
-
-        # Contiguous-prefix bound. The DSv4 logical anchor stores no KV object,
-        # so KV pages are implicitly present and the bound comes from ALL_PAGES
-        # sidecars only.
-        limit = (
-            num_pages
-            if self.storage.mem_pool_host.kv_buffer is None
-            else int(self.storage.batch_exists(page_keys))
-        )
-
-        # Trailing-window pools: keep the full per-page mask as a prefix count so
-        # each candidate boundary can be tested in O(1).
-        windows: list[tuple[int, list[int]]] = []
+        page_keys = list(expanded[0].keys)
+        present = [True] * len(page_keys)
         for transfer in expanded:
-            page_exists = self._page_exists(page_keys, transfer)
-            if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
-                limit = min(
-                    limit,
-                    next(
-                        (i for i, ok in enumerate(page_exists) if not ok),
-                        num_pages,
-                    ),
-                )
-                continue
-            counts = [0] * (num_pages + 1)
-            for i, ok in enumerate(page_exists):
-                counts[i + 1] = counts[i] + int(ok)
-            windows.append((max(1, len(transfer.keys or ())), counts))
-
-        valid = [
-            end
-            for end in range(1, limit + 1)
-            if all(
-                counts[end] - counts[max(0, end - window)] == end - max(0, end - window)
-                for window, counts in windows
-            )
-        ]
+            present = [
+                left and right
+                for left, right in zip(present, self._page_exists(page_keys, transfer))
+            ]
+        hit_pages = next(
+            (index for index, exists in enumerate(present) if not exists),
+            len(page_keys),
+        )
+        valid = list(range(1, hit_pages + 1))
         self._stats["lookup"] += 1
         if valid:
             logger.info(
@@ -446,24 +368,151 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self._expand(transfers)
         if not expanded:
             return False
-        futures = [
-            self._load_executor.submit(self.storage.batch_get_v2, [transfer])
-            for transfer in expanded
-        ]
-        wait(futures)
-        results = {}
-        for future in futures:
-            results.update(future.result())
-        if not self._all_succeeded(results, expanded):
-            return False
-        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
-        loaded = len(kv.keys) * self.page_size
-        self._stats["load"] += 1
-        logger.info("Unified tree Mooncake load back: rid=%s tokens=%d", rid, loaded)
+        if rid in self._pending:
+            raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
+        self._pending[rid] = expanded
         return True
 
+    def cancel_queued_load(self, rid: str) -> None:
+        self._pending.pop(rid, None)
+
+    def start_layer_wise_loading(self) -> int:
+        if not self._pending:
+            return -1
+        pending = self._pending
+        self._pending = {}
+
+        plans = self._build_range_plans(list(pending.values()))
+        counter_index = self.layer_done_counter.update_producer()
+        self._load_queue.put((counter_index, plans))
+        self._stats["load"] += len(pending)
+        return counter_index
+
+    def _load_thread_func(self) -> None:
+        while True:
+            task = self._load_queue.get()
+            try:
+                if task is None:
+                    return
+                counter_index, plans = task
+                self._run_layer_wise_batch(counter_index, plans)
+            finally:
+                self._load_queue.task_done()
+
+    def _build_range_plans(
+        self, request_transfers: list[list[PoolTransfer]]
+    ) -> list[_LayerRangePlan]:
+        grouped: dict[PoolName, list[PoolTransfer]] = {}
+        for transfers in request_transfers:
+            for transfer in transfers:
+                grouped.setdefault(transfer.name, []).append(transfer)
+
+        plans = []
+        for name, transfers in grouped.items():
+            keys = []
+            locations = []
+            for transfer in transfers:
+                component_keys, multiplier = (
+                    self.storage._get_hybrid_page_component_keys(
+                        list(transfer.keys), transfer
+                    )
+                )
+                if multiplier != 1:
+                    raise ValueError(
+                        "Layer-wise ranges require one object per page, got "
+                        f"{multiplier} for pool {name}."
+                    )
+                keys.extend(self.storage._tag_keys(component_keys))
+                locations.extend(
+                    self.pools[name].prepare_locations(transfer.host_indices)
+                )
+            if len(locations) != len(keys):
+                raise ValueError(
+                    f"Layer-wise Mooncake pool {name} has {len(keys)} keys but "
+                    f"{len(locations)} destination pages."
+                )
+            plans.append(
+                _LayerRangePlan(
+                    name=name,
+                    pool=self.pools[name],
+                    keys=keys,
+                    locations=locations,
+                )
+            )
+        return plans
+
+    @staticmethod
+    def _status_ok(result: Any, expected: int | None = None) -> bool:
+        if result is None:
+            return True
+        if isinstance(result, int):
+            return result == 0
+        values = list(result)
+        return (expected is None or len(values) == expected) and all(
+            value == 0 for value in values
+        )
+
+    @staticmethod
+    def _range_result_ok(result: Any, sizes: list[list[int]]) -> bool:
+        if result is None or isinstance(result, int):
+            return False
+        return list(result) == [sum(key_sizes) for key_sizes in sizes]
+
+    def _run_layer_wise_batch(
+        self, counter_index: int, plans: list[_LayerRangePlan]
+    ) -> None:
+        started: list[_LayerRangePlan] = []
+        try:
+            for plan in plans:
+                result = self.storage.store.batch_get_session_start(plan.keys)
+                if not self._status_ok(result, len(plan.keys)):
+                    raise RuntimeError(
+                        f"Mooncake session start failed for pool {plan.name}: {result}"
+                    )
+                started.append(plan)
+
+            if not plans or not plans[0].keys:
+                raise ValueError("Layer-wise Mooncake load has no page keys.")
+            num_keys = len(plans[0].keys)
+            if any(len(plan.keys) != num_keys for plan in plans):
+                raise ValueError(
+                    "Layer-wise Mooncake pools must cover the same page set."
+                )
+
+            for layer in range(self.num_layers):
+                for plan in plans:
+                    ptrs, sizes, offsets = plan.get_layer_meta(layer)
+                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                        plan.keys,
+                        ptrs,
+                        sizes,
+                        offsets,
+                    )
+                    if not self._range_result_ok(result, sizes):
+                        raise RuntimeError(
+                            f"Mooncake range get failed for pool={plan.name}, "
+                            f"layer={layer}: transferred={result}, "
+                            f"expected={[sum(item) for item in sizes]}"
+                        )
+                self.layer_done_counter.complete(counter_index, layer)
+        except BaseException as error:
+            self.layer_done_counter.fail(counter_index, error)
+            logger.exception("Mooncake layer-wise load batch failed")
+        finally:
+            for plan in started:
+                try:
+                    result = self.storage.store.batch_get_session_end(plan.keys)
+                    if not self._status_ok(result):
+                        raise RuntimeError(
+                            f"Mooncake session end failed for pool "
+                            f"{plan.name}: {result}"
+                        )
+                except BaseException as error:
+                    self.layer_done_counter.fail(counter_index, error)
+                    logger.exception("Mooncake layer-wise load session cleanup failed")
+
     def offload(self, transfers: list[PoolTransfer]) -> bool:
-        expanded = self._expand(transfers, allow_partial=True)
+        expanded = self._expand(transfers)
         if not expanded:
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
@@ -490,7 +539,14 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         if device is not None:
             torch.cuda.synchronize(device)
 
+    def reset(self) -> None:
+        self._pending.clear()
+        self._load_queue.join()
+        self.layer_done_counter.reset()
+
     def close(self) -> None:
+        self.reset()
+        self._load_queue.put(None)
+        self._load_thread.join()
         logger.info("Unified tree Mooncake stats: %s", self._stats)
-        self._load_executor.shutdown(wait=True)
         self.storage.close()

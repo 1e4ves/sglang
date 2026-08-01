@@ -45,7 +45,6 @@ from sglang.srt.mem_cache.unified_cache_components import (
     CacheTransferPhase,
     ComponentData,
     ComponentType,
-    ConnectorTransferPhase,
     EvictLayer,
     FullComponent,
     LRURefreshPhase,
@@ -61,7 +60,6 @@ from sglang.srt.mem_cache.unified_cache_connector_mixin import (
 from sglang.srt.mem_cache.utils import (
     compute_node_hash_values,
     get_eviction_strategy,
-    get_hash_str,
     split_node_hash_value,
 )
 from sglang.srt.observability.metrics_collector import (
@@ -388,7 +386,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
 
-        self.connector: Optional["UnifiedTreeConnector"] = None
+        self.connector: Optional[UnifiedTreeConnector] = None
 
         self.reset()
         logger.info(f"Init Unified RadixTree with components {self.tree_components}")
@@ -464,6 +462,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.connector is not None:
+            self.connector.reset()
         self.root_node = UnifiedTreeNode(self.tree_components)
         self.root_node.priority = -sys.maxsize
         self.root_node.key = RadixKey(array("q"), None)
@@ -876,12 +876,12 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         new_indices = match_result.device_indices
         new_last_node = match_result.last_device_node
         new_prefix_len = result.prefix_len
-        assert req.cache_protected_len <= len(new_indices) + self.page_size - 1, (
-            f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
-        )
-        assert new_prefix_len <= len(new_indices), (
-            f"{new_prefix_len=}, {len(new_indices)=}"
-        )
+        assert (
+            req.cache_protected_len <= len(new_indices) + self.page_size - 1
+        ), f"{req.cache_protected_len=}, {len(new_indices)=}, {page_aligned_len=}"
+        assert new_prefix_len <= len(
+            new_indices
+        ), f"{new_prefix_len=}, {len(new_indices)=}"
         self.req_to_token_pool.write(
             (req.req_pool_idx, slice(req.cache_protected_len, len(new_indices))),
             new_indices[req.cache_protected_len :],
@@ -2632,7 +2632,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:
-        """Notify the cache controller to start the KV cache loading."""
+        """Start the queued layer-wise load for the next prefill batch."""
+        if self.connector is not None:
+            return self.connector.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

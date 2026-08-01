@@ -196,6 +196,10 @@ def _create_unified_radix_cache(
         )
     elif server_args.enable_unified_tree_connector:
         cache.init_connector(server_args, params)
+        counter = cache.connector.layer_done_counter
+        kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        kvcache.register_layer_transfer_counter(counter)
+        ctx.tp_worker.register_hicache_layer_transfer_counter(counter)
     return cache
 
 

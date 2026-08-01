@@ -12,9 +12,9 @@ The tree only needs a handful of guarded hooks:
 * ``init_load_back``    -> :meth:`UnifiedCacheConnectorMixin._load_connector`
 * ``_inc_hit_count``    -> :meth:`UnifiedCacheConnectorMixin._offload_connector_node`
 
-Division of labour: the connector is a synchronous, single-rank transport for
-tree-built ``PoolTransfer`` lists. Everything cross-rank (hit-set intersection,
-IO outcome agreement) is decided on the tree side, here.
+Division of labour: the connector owns each rank's transport, including an
+optional layer-wise background load. Everything cross-rank (hit-set
+intersection, IO outcome agreement) is decided on the tree side, here.
 """
 
 from __future__ import annotations
@@ -46,7 +46,9 @@ if TYPE_CHECKING:
 
 
 class UnifiedTreeConnector(ABC):
-    """Synchronous remote transport for tree-built pool transfers."""
+    """Remote transport for tree-built pool transfers."""
+
+    layer_done_counter: object
 
     @abstractmethod
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
@@ -64,11 +66,26 @@ class UnifiedTreeConnector(ABC):
 
     @abstractmethod
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
-        """Load every transfer into its device indices atomically."""
+        """Prepare a load into device indices.
+
+        A layer-wise implementation queues the transfer for the next
+        ``start_layer_wise_loading`` call. Other implementations may complete
+        the load synchronously.
+        """
+
+    @abstractmethod
+    def start_layer_wise_loading(self) -> int:
+        """Start queued loads and return the layer-counter consumer index."""
+
+    def cancel_queued_load(self, rid: str) -> None:
+        """Remove a queued request before layer-wise loading starts."""
 
     @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
         """Persist every transfer atomically."""
+
+    def reset(self) -> None:
+        pass
 
     def close(self) -> None:
         pass
@@ -90,8 +107,10 @@ class UnifiedCacheConnectorMixin:
     """Connector-driven match / load / offload for the unified radix tree."""
 
     def init_connector(self, server_args: ServerArgs, params: CacheInitParams) -> None:
-        if ComponentType.MAMBA in self.tree_components:
-            raise ValueError("Unified tree connector does not support Mamba yet.")
+        if self.tree_components != (ComponentType.FULL,):
+            raise ValueError(
+                "Unified tree connector currently supports FULL-only models."
+            )
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
             MooncakeTreeConnector,
         )
@@ -220,8 +239,10 @@ class UnifiedCacheConnectorMixin:
         assert full.name == PoolName.KV
 
         transfers = [transfer for _, transfer in component_transfers]
-        success = self.connector.load(req.rid, transfers)
-        success = self._connector_sync_success(success)
+        local_success = self.connector.load(req.rid, transfers)
+        success = self._connector_sync_success(local_success)
+        if local_success and not success:
+            self.connector.cancel_queued_load(req.rid)
         for component, transfer in component_transfers:
             component.finish_connector_load(req, full, transfer, prefix_len, success)
         if not success:
