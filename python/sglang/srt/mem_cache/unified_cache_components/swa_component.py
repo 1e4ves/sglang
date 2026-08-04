@@ -792,9 +792,7 @@ class SWAComponent(TreeComponent):
                 swa_evicted_seqlen=boundary,
             )
         else:
-            req.kv.swa_evicted_seqlen = max(
-                req.kv.swa_evicted_seqlen, boundary
-            )
+            req.kv.swa_evicted_seqlen = max(req.kv.swa_evicted_seqlen, boundary)
 
     def commit_hicache_transfer(
         self,

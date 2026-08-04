@@ -22,6 +22,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     CacheTransferPhase,
     ComponentType,
+    ConnectorTransferPhase,
     EvictLayer,
     LRURefreshPhase,
     TreeComponent,
@@ -468,6 +469,58 @@ class MambaComponent(TreeComponent):
             ):
                 self._free_mamba_value(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
+
+    def build_connector_transfer(
+        self,
+        phase: ConnectorTransferPhase,
+        *,
+        node: Optional[UnifiedTreeNode] = None,
+        keys: Optional[Sequence[str]] = None,
+    ) -> Optional[PoolTransfer]:
+        if phase == ConnectorTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            transfer_keys = [node.hash_value[-1]]
+            slots = value.to(torch.int64)
+        else:
+            if not keys:
+                return None
+            transfer_keys = [keys[-1]]
+            slots = None
+            if phase == ConnectorTransferPhase.LOAD:
+                # One radix slot plus one mutable request slot avoids a CoW race.
+                slots = torch.cat([self._alloc_mamba_slot(), self._alloc_mamba_slot()])
+                transfer_keys *= 2
+        return PoolTransfer(
+            name=PoolName.MAMBA,
+            device_indices=slots,
+            keys=transfer_keys,
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        )
+
+    def finish_connector_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        del full_transfer, prefix_len
+        if not success:
+            self._free_mamba_value(transfer.device_indices)
+            return
+
+        if req.mamba_pool_idx is not None:
+            self.cache.req_to_token_pool.mamba_allocator.free(
+                req.mamba_pool_idx.view(-1)
+            )
+        req.mamba_pool_idx = transfer.device_indices[1]
+        req.mamba_cow_src_index = None
+        req.mamba_needs_clear = False
 
     # ---- HiCache Hooks ----
 

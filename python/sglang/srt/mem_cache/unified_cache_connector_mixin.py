@@ -107,9 +107,14 @@ class UnifiedCacheConnectorMixin:
     """Connector-driven match / load / offload for the unified radix tree."""
 
     def init_connector(self, server_args: ServerArgs, params: CacheInitParams) -> None:
-        if self.tree_components != (ComponentType.FULL,):
+        supported = {
+            (ComponentType.FULL,),
+            (ComponentType.FULL, ComponentType.SWA),
+            (ComponentType.FULL, ComponentType.MAMBA),
+        }
+        if self.tree_components not in supported:
             raise ValueError(
-                "Unified tree connector currently supports FULL-only models."
+                "Unified tree connector supports FULL, FULL+SWA, and FULL+MAMBA."
             )
         from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
             MooncakeTreeConnector,
@@ -159,6 +164,7 @@ class UnifiedCacheConnectorMixin:
             if swa_transfer is not None
             else 0
         )
+        mamba_host_hit_length = int(PoolName.MAMBA in by_pool)
 
         self._connector_markers[req.rid] = ConnectorMarker(
             key=key[: device_hit_len + hit_tokens],
@@ -169,6 +175,9 @@ class UnifiedCacheConnectorMixin:
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
             swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            mamba_host_hit_length=max(
+                result.mamba_host_hit_length, mamba_host_hit_length
+            ),
         )
 
     def _sync_connector_hit_pages(
@@ -250,10 +259,23 @@ class UnifiedCacheConnectorMixin:
 
         # Insert the newly loaded tail into the tree.
         values = torch.cat([req.prefix_indices.to(torch.int64), full.device_indices])
-        self.insert(
+        mamba_transfer = next(
+            (
+                transfer
+                for _, transfer in component_transfers
+                if transfer.name == PoolName.MAMBA
+            ),
+            None,
+        )
+        insert_result = self.insert(
             InsertParams(
                 key=marker.key,
                 value=values,
+                mamba_value=(
+                    mamba_transfer.device_indices[:1]
+                    if mamba_transfer is not None
+                    else None
+                ),
                 prev_prefix_len=device_hit_len,
                 swa_evicted_seqlen=(
                     req.kv.swa_evicted_seqlen if req.kv is not None else 0
@@ -262,6 +284,10 @@ class UnifiedCacheConnectorMixin:
                 priority=getattr(req, "priority", 0) or 0,
             )
         )
+        if mamba_transfer is not None and insert_result.mamba_exist:
+            self.req_to_token_pool.mamba_allocator.free(
+                mamba_transfer.device_indices[:1]
+            )
 
         # Rematch
         loaded = self.match_prefix(MatchPrefixParams(key=marker.key))
