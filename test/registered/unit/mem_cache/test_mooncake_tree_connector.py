@@ -1,3 +1,5 @@
+import threading
+from queue import Queue
 from types import SimpleNamespace
 
 import torch
@@ -7,11 +9,12 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+    DevicePoolEntry,
+    resolve_hybrid_device_pool_group,
+)
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
     MooncakeTreeConnector,
-    _build_dsv4_pools,
-    _build_hybrid_linear_pools,
-    _MappedRowsPool,
 )
 from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
@@ -57,10 +60,15 @@ def test_sparse_multi_component_layer_ranges():
     k2 = torch.zeros((8, 5), dtype=torch.uint8)
     v0 = torch.zeros((8, 7), dtype=torch.uint8)
     v2 = torch.zeros((8, 11), dtype=torch.uint8)
-    pool = _MappedRowsPool(
-        [[k0, None, k2], [v0, None, v2]],
+    pool = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=None,
+        components=[[k0, k2], [v0, v2]],
+        layer_mapping={0: 0, 2: 1},
         page_size=2,
         rows_are_pages=False,
+        packed=False,
     )
 
     indices = torch.tensor([0, 1, 4, 5])
@@ -109,7 +117,100 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
-def test_deepseek_v4_builder_maps_sparse_sidecars():
+def test_offload_runs_on_background_thread():
+    started = threading.Event()
+    release = threading.Event()
+    caller_thread = threading.get_ident()
+    worker_threads = []
+
+    class _Storage:
+        def batch_set_v2(self, transfers):
+            worker_threads.append(threading.get_ident())
+            started.set()
+            assert release.wait(timeout=5)
+            return {
+                transfer.name: [True] * len(transfer.keys) for transfer in transfers
+            }
+
+    pool = SimpleNamespace(
+        translate_indices=lambda indices: indices,
+        get_hybrid_pool_buffer=lambda: [],
+    )
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.page_size = 2
+    connector.sources = {PoolName.KV: PoolName.KV}
+    connector.pools = {PoolName.KV: pool}
+    connector.storage = _Storage()
+    connector._stats = {"lookup": 0, "load": 0, "offload": 0}
+    connector.offload_queue = Queue()
+    connector.offload_results = Queue()
+    connector.offload_thread = threading.Thread(
+        target=connector.offload_thread_func, daemon=True
+    )
+    connector.offload_thread.start()
+
+    assert connector.offload(
+        [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["page"],
+                device_indices=torch.tensor([0, 1]),
+            )
+        ]
+    )
+    assert started.wait(timeout=5)
+    assert connector.num_completed_offloads() == 0
+    assert worker_threads == [connector.offload_thread.ident]
+    assert worker_threads[0] != caller_thread
+
+    release.set()
+    connector.offload_queue.join()
+    assert connector.num_completed_offloads() == 1
+    assert connector.pop_completed_offload()
+    connector.offload_queue.put(None)
+    connector.offload_thread.join(timeout=5)
+
+
+def test_async_offload_pins_node_until_completion():
+    class _Component:
+        def build_connector_transfer(self, phase, node=None):
+            assert phase == ConnectorTransferPhase.OFFLOAD
+            return PoolTransfer(name=PoolName.KV, keys=["page"])
+
+    results = []
+    connector = SimpleNamespace(
+        offload=lambda transfers: True,
+        num_completed_offloads=lambda: len(results),
+        pop_completed_offload=lambda: results.pop(0),
+    )
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.connector = connector
+    mixin._components_tuple = (_Component(),)
+    mixin.connector_offloads = []
+    lock_params = object()
+    locks = []
+    unlocks = []
+
+    def inc_lock_ref(node):
+        locks.append(node)
+        return SimpleNamespace(to_dec_params=lambda: lock_params)
+
+    mixin.inc_lock_ref = inc_lock_ref
+    mixin.dec_lock_ref = lambda node, params: unlocks.append((node, params))
+    node = SimpleNamespace(connector_offloaded=False)
+
+    mixin.offload_connector_node(node)
+    assert locks == [node]
+    assert node.connector_offloaded
+    assert not unlocks
+
+    results.append(False)
+    mixin.drain_connector_offloads()
+    assert not node.connector_offloaded
+    assert unlocks == [(node, lock_params)]
+
+
+def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
         DeepSeekV4LayerItem,
         DeepSeekV4TokenToKVPool,
@@ -127,15 +228,19 @@ def test_deepseek_v4_builder_maps_sparse_sidecars():
     kvcache.end_layer = 3
     kvcache.swa_page_size = 2
     kvcache.swa_kv_pool = SimpleNamespace(
-        kv_buffer=[torch.zeros((8, 3)) for _ in range(3)]
+        kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
     )
     kvcache.c4_kv_pool = SimpleNamespace(
-        kv_buffer=[torch.zeros((8, 5)) for _ in range(2)]
+        kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
     )
     kvcache.c4_indexer_kv_pool = SimpleNamespace(
-        index_k_with_scale_buffer=[torch.zeros((8, 7)) for _ in range(2)]
+        index_k_with_scale_buffer=[
+            torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
+        ]
     )
-    kvcache.c128_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 11))])
+    kvcache.c128_kv_pool = SimpleNamespace(
+        kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)]
+    )
     kvcache.layer_mapping = [
         DeepSeekV4LayerItem(4, 0),
         DeepSeekV4LayerItem(128, 0),
@@ -144,17 +249,29 @@ def test_deepseek_v4_builder_maps_sparse_sidecars():
     kvcache.compress_state_pools = [state_pool(), None, state_pool()]
     kvcache.indexer_compress_state_pools = [state_pool(), None, state_pool()]
 
-    _, pools, sources, num_layers = _build_dsv4_pools(kvcache, 2)
-    assert num_layers == 3
-    assert set(pools) == {PoolName.KV, PoolName.SWA}
-    assert sources == {PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA}
-    _, sizes, _ = pools[PoolName.KV].get_prepared_layer_range_meta([0], 0)
-    assert len(sizes[0]) == 2
-    _, sizes, _ = pools[PoolName.KV].get_prepared_layer_range_meta([0], 1)
-    assert len(sizes[0]) == 1
+    group = resolve_hybrid_device_pool_group(kvcache, 2, None)
+    assert group.num_layers == 3
+    assert set(group.entry_map) == {
+        PoolName.SWA,
+        PoolName.DEEPSEEK_V4_C4,
+        PoolName.DEEPSEEK_V4_C4_INDEXER,
+        PoolName.DEEPSEEK_V4_C128,
+        PoolName.DEEPSEEK_V4_C4_STATE,
+        PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
+    }
+    assert group.sources[PoolName.DEEPSEEK_V4_C4] == PoolName.KV
+    assert group.sources[PoolName.DEEPSEEK_V4_C4_STATE] == PoolName.SWA
+    c4_pool = group.entry_map[PoolName.DEEPSEEK_V4_C4]
+    pointers, sizes = c4_pool.get_page_buffer_meta(torch.tensor([0, 1]))
+    assert len(pointers) == 2
+    assert sizes == [5, 5]
+    _, sizes, offsets = c4_pool.get_prepared_layer_range_meta([0], 2)
+    assert sizes == [[5]]
+    assert offsets == [[5]]
+    assert c4_pool.get_prepared_layer_range_meta([0], 1) is None
 
 
-def test_qwen35_builder_maps_full_and_mamba_layers():
+def test_qwen35_device_pool_group_maps_full_and_mamba_layers():
     from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
     kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
@@ -178,16 +295,20 @@ def test_qwen35_builder_maps_full_and_mamba_layers():
         translate_mamba_indices=lambda indices: indices,
     )
 
-    _, pools, sources, num_layers = _build_hybrid_linear_pools(kvcache, 2, req_pool)
-    assert num_layers == 4
+    group = resolve_hybrid_device_pool_group(kvcache, 2, req_pool)
+    pools = group.entry_map
+    assert group.num_layers == 4
     assert set(pools) == {PoolName.KV, PoolName.MAMBA}
-    assert sources == {PoolName.KV: PoolName.KV, PoolName.MAMBA: PoolName.MAMBA}
+    assert group.sources == {
+        PoolName.KV: PoolName.KV,
+        PoolName.MAMBA: PoolName.MAMBA,
+    }
     assert pools[PoolName.MAMBA].translate_indices(torch.tensor([1])).tolist() == [1]
     assert pools[PoolName.KV].get_prepared_layer_range_meta([0], 1) is None
     assert pools[PoolName.MAMBA].get_prepared_layer_range_meta([0], 0) is None
     pointers, sizes = pools[PoolName.KV].get_page_buffer_meta(torch.tensor([0, 1]))
-    assert len(pointers) == 1
-    assert len(sizes[0]) == 4
+    assert len(pointers) == 4
+    assert sizes == [24, 40, 56, 88]
 
 
 def test_swa_connector_finish_maps_or_releases_slots():

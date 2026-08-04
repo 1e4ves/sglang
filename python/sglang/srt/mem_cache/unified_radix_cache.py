@@ -492,7 +492,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         self.ongoing_prefetch: dict[str, _OngoingPrefetch] = {}
         self.ongoing_backup: dict[int, tuple[UnifiedTreeNode, DecLockRefParams]] = {}
 
-        self._reset_connector_state()
+        self.reset_connector_state()
 
         if self.cache_controller is not None:
             self.cache_controller.reset()
@@ -583,7 +583,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         self.sidecar_pool_specs.append(spec)
 
     def release_host_resources(self) -> None:
-        self._close_connector()
+        self.close_connector()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -615,7 +615,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         )
 
         if self.connector is not None and params.req is not None:
-            result = self._match_connector(key, params.req, result)
+            result = self.match_connector(key, params.req, result)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -1855,7 +1855,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
             and not node.connector_offloaded
             and node.hit_count >= self.write_through_threshold
         ):
-            self._offload_connector_node(node)
+            self.offload_connector_node(node)
 
     def write_backup_storage(self, node: UnifiedTreeNode) -> None:
         if (
@@ -2189,7 +2189,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
-        self._release_connector_request(rid)
+        self.release_connector_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -2565,7 +2565,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
             and params.req is not None
             and params.req.rid in self._connector_markers
         ):
-            return self._load_connector(params.req)
+            return self.load_connector(params.req)
 
         best_match_node = params.best_match_node
         mem_quota = params.mem_quota
@@ -2618,6 +2618,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        self.drain_connector_offloads()
         self.writing_check()
         self.loading_check()
         if self.enable_storage:
@@ -2629,6 +2630,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, KVCacheEventMixin, BasePrefi
 
     def flush_write_through_acks(self) -> None:
         """Flush pending write-through acknowledgements."""
+        self.drain_connector_offloads()
         self.writing_check()
 
     def ready_to_load_host_cache(self) -> int:

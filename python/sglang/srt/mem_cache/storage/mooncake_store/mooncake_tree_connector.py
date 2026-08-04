@@ -2,9 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from collections.abc import Sequence
 from dataclasses import dataclass, replace
-from queue import Queue
+from queue import Empty, Queue
 from typing import Any
 
 import torch
@@ -19,354 +18,12 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+    resolve_hybrid_device_pool_group,
+)
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
 
 logger = logging.getLogger(__name__)
-
-
-def _prefix_offsets(sizes: Sequence[int]) -> tuple[int, ...]:
-    offsets = []
-    current = 0
-    for size in sizes:
-        offsets.append(current)
-        current += size
-    return tuple(offsets)
-
-
-class _LogicalPool:
-    def __init__(self, page_size: int):
-        self.page_size = page_size
-        self.kv_buffer = None
-
-
-class _LayerRowsPool:
-    def __init__(
-        self,
-        buffers: Sequence[torch.Tensor],
-        page_size: int,
-        *,
-        rows_are_pages: bool,
-    ):
-        if not buffers:
-            raise ValueError("Direct Mooncake requires at least one layer buffer.")
-        self.kv_buffer = list(buffers)
-        self.page_size = page_size
-        self._page_offsets = torch.arange(page_size)
-        self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
-        self._row_span = 1 if rows_are_pages else page_size
-        self._rows_are_pages = rows_are_pages
-        self._row_sizes = tuple(
-            buffer[0].numel() * buffer.element_size() * self._row_span
-            for buffer in self.kv_buffer
-        )
-        self._layer_offsets = _prefix_offsets(self._row_sizes)
-
-    def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
-        return self.kv_buffer
-
-    def _rows(self, indices: torch.Tensor) -> torch.Tensor:
-        slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
-            raise ValueError(
-                f"Mooncake transfer has {slots.numel()} indices, expected a "
-                f"multiple of page_size={self.page_size}."
-            )
-        if not slots.numel():
-            return torch.empty((0,), dtype=torch.int64)
-
-        pages = slots.reshape(-1, self.page_size)
-        starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
-        ):
-            raise ValueError(
-                "Direct Mooncake requires aligned contiguous device pages."
-            )
-
-        rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._rows_are_pages
-            else starts
-        )
-        first_row = int(rows.min())
-        last_row = int(rows.max()) + self._row_span
-        if first_row < 0 or last_row > self._row_count:
-            bad_row = first_row if first_row < 0 else last_row - 1
-            raise ValueError(
-                f"Mooncake row {bad_row} exceeds buffer shapes "
-                f"{[tuple(buffer.shape) for buffer in self.kv_buffer]}."
-            )
-        return rows
-
-    def get_page_buffer_meta(self, indices: torch.Tensor):
-        rows = self._rows(indices).tolist()
-        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
-        return ptrs, list(self._row_sizes) * len(rows)
-
-    def prepare_locations(self, indices: torch.Tensor) -> list[int]:
-        return self._rows(indices).tolist()
-
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        size = self._row_sizes[layer]
-        offset = self._layer_offsets[layer]
-        return (
-            [[self.kv_buffer[layer][row].data_ptr()] for row in locations],
-            [[size] for _ in locations],
-            [[offset] for _ in locations],
-        )
-
-    def translate_indices(self, indices: torch.Tensor) -> torch.Tensor:
-        return indices
-
-
-class _TokenRowsPool(_LayerRowsPool):
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
-        super().__init__(buffers, page_size, rows_are_pages=False)
-
-
-class _PageRowsPool(_LayerRowsPool):
-    def __init__(self, buffers: Sequence[torch.Tensor], page_size: int):
-        super().__init__(buffers, page_size, rows_are_pages=True)
-
-
-class _MappedRowsPool(_LayerRowsPool):
-    def __init__(
-        self,
-        components: Sequence[Sequence[torch.Tensor | None]],
-        page_size: int,
-        *,
-        rows_are_pages: bool,
-        packed: bool = False,
-    ):
-        self.components = [list(component) for component in components]
-        buffers = [
-            buffer
-            for component in components
-            for buffer in component
-            if buffer is not None
-        ]
-        self.num_layers = len(self.components[0])
-        self.packed = packed
-        super().__init__(buffers, page_size, rows_are_pages=rows_are_pages)
-
-        self.layer_items = [[] for _ in range(self.num_layers)]
-        offset = 0
-        for component in self.components:
-            if not packed:
-                offset = 0
-            for layer, buffer in enumerate(component):
-                if buffer is not None:
-                    size = buffer[0].nbytes * self._row_span
-                    self.layer_items[layer].append((buffer, size, offset))
-                    offset += size
-
-    def get_page_buffer_meta(self, indices: torch.Tensor):
-        ptrs, sizes = super().get_page_buffer_meta(indices)
-        if not self.packed:
-            return ptrs, sizes
-        width = len(self.kv_buffer)
-        return (
-            [ptrs[i : i + width] for i in range(0, len(ptrs), width)],
-            [sizes[i : i + width] for i in range(0, len(sizes), width)],
-        )
-
-    def get_prepared_layer_range_meta(self, locations: list[int], layer: int):
-        items = self.layer_items[layer]
-        if not items:
-            return None
-        ptrs, sizes, offsets = [], [], []
-        for row in locations:
-            row_ptrs = [buffer[row].data_ptr() for buffer, _, _ in items]
-            row_sizes = [size for _, size, _ in items]
-            row_offsets = [offset for _, _, offset in items]
-            if self.packed:
-                ptrs.append(row_ptrs)
-                sizes.append(row_sizes)
-                offsets.append(row_offsets)
-            else:
-                ptrs.extend([[value] for value in row_ptrs])
-                sizes.extend([[value] for value in row_sizes])
-                offsets.extend([[value] for value in row_offsets])
-        return ptrs, sizes, offsets
-
-
-def _mapped(
-    buffers: Sequence[torch.Tensor],
-    num_layers: int,
-    layer_to_buffer: dict[int, int],
-) -> list[torch.Tensor | None]:
-    mapped: list[torch.Tensor | None] = [None] * num_layers
-    for layer, buffer_index in layer_to_buffer.items():
-        mapped[layer] = buffers[buffer_index]
-    return mapped
-
-
-def _state_view(pool: Any) -> torch.Tensor:
-    state = pool.kv_score_buffer.kv_score
-    ring = int(pool.ring_size)
-    usable = state.shape[0] // ring * ring
-    return (
-        state.view(torch.uint8)
-        .reshape(state.shape[0], -1)[:usable]
-        .reshape(usable // ring, -1)
-    )
-
-
-def _build_dsv4_pools(kvcache: Any, page_size: int):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
-
-    if kvcache._unified_kv or isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
-        raise ValueError("Direct Mooncake does not support unified-KV or HiSparse.")
-    if kvcache.swa_page_size != page_size:
-        raise ValueError(
-            "DeepSeek V4 SWA page size must match the tree page size: "
-            f"{kvcache.swa_page_size} != {page_size}."
-        )
-
-    stage = kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
-    num_layers = len(stage)
-    c4, c128 = (
-        {
-            layer: item.compress_layer_id
-            for layer, item in enumerate(stage)
-            if item.compress_ratio == ratio
-        }
-        for ratio in (4, 128)
-    )
-    kv_components = [
-        _mapped(kvcache.c4_kv_pool.kv_buffer, num_layers, c4),
-        _mapped(
-            kvcache.c4_indexer_kv_pool.index_k_with_scale_buffer,
-            num_layers,
-            c4,
-        ),
-        _mapped(kvcache.c128_kv_pool.kv_buffer, num_layers, c128),
-    ]
-    global_layers = [kvcache.start_layer + layer for layer in c4]
-    state_map = {layer: index for index, layer in enumerate(c4)}
-    swa_components = [
-        list(kvcache.swa_kv_pool.kv_buffer),
-        *[
-            _mapped(
-                [_state_view(states[layer]) for layer in global_layers],
-                num_layers,
-                state_map,
-            )
-            for states in (
-                kvcache.compress_state_pools,
-                kvcache.indexer_compress_state_pools,
-            )
-        ],
-    ]
-
-    pools = {
-        PoolName.KV: _MappedRowsPool(
-            kv_components,
-            page_size,
-            rows_are_pages=True,
-            packed=True,
-        ),
-        PoolName.SWA: _MappedRowsPool(
-            swa_components,
-            page_size,
-            rows_are_pages=True,
-            packed=True,
-        ),
-    }
-    return (
-        _LogicalPool(page_size),
-        pools,
-        {PoolName.KV: PoolName.KV, PoolName.SWA: PoolName.SWA},
-        num_layers,
-    )
-
-
-def _build_hybrid_linear_pools(kvcache: Any, page_size: int, req_to_token_pool: Any):
-    if getattr(req_to_token_pool, "mamba_ckpt_pool", None) is not None:
-        raise ValueError(
-            "Direct Mooncake does not support int8 Mamba checkpoint storage."
-        )
-
-    layer_ids = set(kvcache.full_attention_layer_id_mapping) | set(
-        req_to_token_pool.mamba_map
-    )
-    start_layer = min(layer_ids)
-    num_layers = max(layer_ids) - start_layer + 1
-    full_mapping = {
-        global_layer - start_layer: local_layer
-        for global_layer, local_layer in kvcache.full_attention_layer_id_mapping.items()
-    }
-    full_pool = kvcache.full_kv_pool
-    if kvcache.use_mla or getattr(full_pool, "k_scale_buffer", None) is not None:
-        raise ValueError("Direct Mooncake requires unquantized Qwen3.5 MHA KV.")
-    kv_pool = _MappedRowsPool(
-        [
-            _mapped(full_pool.k_buffer, num_layers, full_mapping),
-            _mapped(full_pool.v_buffer, num_layers, full_mapping),
-        ],
-        page_size,
-        rows_are_pages=full_pool.k_buffer[0].shape[0] < full_pool.size + page_size,
-        packed=True,
-    )
-
-    state = req_to_token_pool.mamba_pool.mamba_cache
-    mamba_mapping = {
-        layer - start_layer: index
-        for layer, index in req_to_token_pool.mamba_map.items()
-    }
-    temporal_size = state.temporal[0, 0].numel() if state.temporal.numel() else 0
-    state_tensors = ([state.temporal] if temporal_size else []) + list(state.conv)
-    mamba_pool = _MappedRowsPool(
-        [_mapped(tensor, num_layers, mamba_mapping) for tensor in state_tensors],
-        page_size=1,
-        rows_are_pages=True,
-    )
-    mamba_pool.temporal_state_elem_size = temporal_size
-    mamba_pool.conv_buffer = list(state.conv)
-    mamba_pool.translate_indices = req_to_token_pool.translate_mamba_indices
-
-    return (
-        _LogicalPool(page_size),
-        {PoolName.KV: kv_pool, PoolName.MAMBA: mamba_pool},
-        {PoolName.KV: PoolName.KV, PoolName.MAMBA: PoolName.MAMBA},
-        num_layers,
-    )
-
-
-def _build_pools(kvcache: Any, page_size: int, req_to_token_pool: Any):
-    from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
-        DeepSeekV4TokenToKVPool,
-    )
-    from sglang.srt.mem_cache.memory_pool import (
-        DSATokenToKVPool,
-        HybridLinearKVPool,
-    )
-
-    if isinstance(kvcache, DeepSeekV4TokenToKVPool):
-        return _build_dsv4_pools(kvcache, page_size)
-    if isinstance(kvcache, HybridLinearKVPool):
-        return _build_hybrid_linear_pools(kvcache, page_size, req_to_token_pool)
-
-    if not isinstance(kvcache, DSATokenToKVPool):
-        raise TypeError(
-            "Direct Mooncake supports DSA, DeepSeek V4, and hybrid linear KV pools."
-        )
-    if kvcache.page_size != page_size:
-        raise ValueError(
-            "DSA KV page size must match the tree page size: "
-            f"{kvcache.page_size} != {page_size}."
-        )
-
-    pools = {
-        PoolName.KV: _TokenRowsPool(kvcache.kv_buffer, page_size),
-        PoolName.INDEXER: _PageRowsPool(kvcache.index_k_with_scale_buffer, page_size),
-    }
-    return (
-        _LogicalPool(page_size),
-        pools,
-        {PoolName.KV: PoolName.KV, PoolName.INDEXER: PoolName.KV},
-        len(kvcache.kv_buffer),
-    )
 
 
 class LayerWiseLoadCounter:
@@ -441,12 +98,12 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
-        (
-            anchor,
-            self.pools,
-            self.sources,
-            self.num_layers,
-        ) = _build_pools(kvcache, self.page_size, params.req_to_token_pool)
+        pool_group = resolve_hybrid_device_pool_group(
+            kvcache, self.page_size, params.req_to_token_pool
+        )
+        self.pools = pool_group.entry_map
+        self.sources = pool_group.sources
+        self.num_layers = pool_group.num_layers
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -475,7 +132,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             self.storage = MooncakeStore(storage_config, mem_pool=None)
         else:
             self.storage = _storage
-        self.storage.mem_pool_host = anchor
+        self.storage.mem_pool_host = pool_group
         self.storage.registered_pools = self.pools
         rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
         self.storage.mla_suffix = rank_suffix
@@ -489,14 +146,22 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 self.layer_done_counter
             )
         self._pending: dict[str, list[PoolTransfer]] = {}
-        self._load_queue: Queue[tuple[int, list[_LayerRangePlan]] | None] = Queue()
+        self.load_queue: Queue[tuple[int, list[_LayerRangePlan]] | None] = Queue()
+        self.offload_queue: Queue[tuple[list[PoolTransfer], int] | None] = Queue()
+        self.offload_results: Queue[bool] = Queue()
         self._stats = {"lookup": 0, "load": 0, "offload": 0}
-        self._load_thread = threading.Thread(
-            target=self._load_thread_func,
+        self.load_thread = threading.Thread(
+            target=self.load_thread_func,
             daemon=True,
             name=f"mooncake-layerwise-tp{tp_rank}",
         )
-        self._load_thread.start()
+        self.load_thread.start()
+        self.offload_thread = threading.Thread(
+            target=self.offload_thread_func,
+            daemon=True,
+            name=f"mooncake-offload-tp{tp_rank}",
+        )
+        self.offload_thread.start()
 
     def _validate_range_api(self) -> None:
         required = (
@@ -642,20 +307,20 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
         plans = self._build_range_plans(list(pending.values()))
         counter_index = self.layer_done_counter.update_producer()
-        self._load_queue.put((counter_index, plans))
+        self.load_queue.put((counter_index, plans))
         self._stats["load"] += len(pending)
         return counter_index
 
-    def _load_thread_func(self) -> None:
+    def load_thread_func(self) -> None:
         while True:
-            task = self._load_queue.get()
+            task = self.load_queue.get()
             try:
                 if task is None:
                     return
                 counter_index, plans = task
                 self._run_layer_wise_batch(counter_index, plans)
             finally:
-                self._load_queue.task_done()
+                self.load_queue.task_done()
 
     def _build_range_plans(
         self, request_transfers: list[list[PoolTransfer]]
@@ -785,14 +450,35 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        self._wait_for_device()
-        results = self.storage.batch_set_v2(expanded)
-        if not self._all_succeeded(results, expanded):
-            return False
-        self._stats["offload"] += 1
-        if self._stats["offload"] == 1:
-            logger.info("Unified tree Mooncake offload: tokens=%d", tokens)
+        self.offload_queue.put((expanded, tokens))
         return True
+
+    def offload_thread_func(self) -> None:
+        while True:
+            task = self.offload_queue.get()
+            try:
+                if task is None:
+                    return
+                expanded, tokens = task
+                self._wait_for_device()
+                results = self.storage.batch_set_v2(expanded)
+                success = self._all_succeeded(results, expanded)
+                if success:
+                    self._stats["offload"] += 1
+                    if self._stats["offload"] == 1:
+                        logger.info("Unified tree Mooncake offload: tokens=%d", tokens)
+                self.offload_results.put(success)
+            except BaseException:
+                logger.exception("Mooncake offload failed")
+                self.offload_results.put(False)
+            finally:
+                self.offload_queue.task_done()
+
+    def num_completed_offloads(self) -> int:
+        return self.offload_results.qsize()
+
+    def pop_completed_offload(self) -> bool:
+        return self.offload_results.get_nowait()
 
     def _wait_for_device(self) -> None:
         device = next(
@@ -809,12 +495,20 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
     def reset(self) -> None:
         self._pending.clear()
-        self._load_queue.join()
+        self.load_queue.join()
+        self.offload_queue.join()
+        while True:
+            try:
+                self.offload_results.get_nowait()
+            except Empty:
+                break
         self.layer_done_counter.reset()
 
     def close(self) -> None:
         self.reset()
-        self._load_queue.put(None)
-        self._load_thread.join()
+        self.load_queue.put(None)
+        self.offload_queue.put(None)
+        self.load_thread.join()
+        self.offload_thread.join()
         logger.info("Unified tree Mooncake stats: %s", self._stats)
         self.storage.close()

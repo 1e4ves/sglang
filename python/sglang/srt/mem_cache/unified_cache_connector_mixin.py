@@ -8,9 +8,9 @@ Self-contained: this module owns both halves of the contract.
 
 The tree only needs a handful of guarded hooks:
 
-* ``match_prefix``      -> :meth:`UnifiedCacheConnectorMixin._match_connector`
-* ``init_load_back``    -> :meth:`UnifiedCacheConnectorMixin._load_connector`
-* ``_inc_hit_count``    -> :meth:`UnifiedCacheConnectorMixin._offload_connector_node`
+* ``match_prefix``      -> :meth:`UnifiedCacheConnectorMixin.match_connector`
+* ``init_load_back``    -> :meth:`UnifiedCacheConnectorMixin.load_connector`
+* ``_inc_hit_count``    -> :meth:`UnifiedCacheConnectorMixin.offload_connector_node`
 
 Division of labour: the connector owns each rank's transport, including an
 optional layer-wise background load. Everything cross-rank (hit-set
@@ -82,7 +82,15 @@ class UnifiedTreeConnector(ABC):
 
     @abstractmethod
     def offload(self, transfers: list[PoolTransfer]) -> bool:
-        """Persist every transfer atomically."""
+        """Queue every transfer for atomic persistence."""
+
+    @abstractmethod
+    def num_completed_offloads(self) -> int:
+        """Return the number of completed offloads waiting to be consumed."""
+
+    @abstractmethod
+    def pop_completed_offload(self) -> bool:
+        """Consume the oldest completed offload and return its result."""
 
     def reset(self) -> None:
         pass
@@ -125,7 +133,7 @@ class UnifiedCacheConnectorMixin:
 
     # ---- match: probe the remote store and report host_hit_length ----
 
-    def _match_connector(
+    def match_connector(
         self, key: RadixKey, req: Req, result: MatchResult
     ) -> MatchResult:
         page = self.page_size
@@ -213,7 +221,7 @@ class UnifiedCacheConnectorMixin:
 
     # ---- init_load_back: remote -> device, then insert ----
 
-    def _load_connector(self, req: Req) -> tuple[torch.Tensor, UnifiedTreeNode]:
+    def load_connector(self, req: Req) -> tuple[torch.Tensor, UnifiedTreeNode]:
         empty = self._empty_match_result.device_indices
         marker = self._connector_markers.pop(req.rid, None)
         if marker is None:
@@ -344,7 +352,7 @@ class UnifiedCacheConnectorMixin:
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
-    def _offload_connector_node(self, node: UnifiedTreeNode) -> None:
+    def offload_connector_node(self, node: UnifiedTreeNode) -> None:
         transfers = []
         for component in self._components_tuple:
             transfer = component.build_connector_transfer(
@@ -353,8 +361,29 @@ class UnifiedCacheConnectorMixin:
             if transfer is not None:
                 transfers.append(transfer)
 
-        stored = self.connector.offload(transfers)
-        node.connector_offloaded = self._connector_sync_success(stored)
+        lock_params = self.inc_lock_ref(node).to_dec_params()
+        try:
+            queued = self.connector.offload(transfers)
+        except BaseException:
+            self.dec_lock_ref(node, lock_params)
+            raise
+        if not queued:
+            self.dec_lock_ref(node, lock_params)
+            return
+
+        node.connector_offloaded = True
+        self.connector_offloads.append((node, lock_params))
+
+    def drain_connector_offloads(self) -> None:
+        if self.connector is None:
+            return
+        count = min(
+            self.connector.num_completed_offloads(), len(self.connector_offloads)
+        )
+        for _ in range(count):
+            node, lock_params = self.connector_offloads.pop(0)
+            node.connector_offloaded = self.connector.pop_completed_offload()
+            self.dec_lock_ref(node, lock_params)
 
     def _connector_sync_success(self, success: bool) -> bool:
         """MIN-reduce a per-rank IO outcome so every rank takes the same branch."""
@@ -364,14 +393,15 @@ class UnifiedCacheConnectorMixin:
 
     # ---- lifecycle helpers used by the tree's own hooks ----
 
-    def _reset_connector_state(self) -> None:
+    def reset_connector_state(self) -> None:
         self._connector_markers: dict[str, ConnectorMarker] = {}
+        self.connector_offloads = []
 
-    def _release_connector_request(self, rid: str) -> None:
+    def release_connector_request(self, rid: str) -> None:
         if self.connector is not None:
             self._connector_markers.pop(rid, None)
 
-    def _close_connector(self) -> None:
+    def close_connector(self) -> None:
         if self.connector is not None:
             self.connector.close()
 
