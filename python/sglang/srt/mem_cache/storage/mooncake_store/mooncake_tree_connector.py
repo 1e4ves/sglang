@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import logging
 import threading
-from dataclasses import dataclass, replace
+from concurrent.futures import Future
+from dataclasses import replace
 from queue import Empty, Queue
 from typing import Any
 
@@ -31,61 +32,43 @@ class LayerWiseLoadCounter:
 
     def __init__(self, num_layers: int):
         self.num_layers = num_layers
-        self._producer_index = -1
+        self.producer_index = -1
         self.consumer_index = -1
-        self._events: dict[int, list[threading.Event]] = {}
-        self._errors: dict[int, BaseException] = {}
+        self.futures: dict[int, list[Future]] = {}
 
     def update_producer(self) -> int:
-        self._producer_index += 1
-        self._events[self._producer_index] = [
-            threading.Event() for _ in range(self.num_layers)
-        ]
-        return self._producer_index
+        self.producer_index += 1
+        self.futures[self.producer_index] = [Future() for _ in range(self.num_layers)]
+        return self.producer_index
 
     def set_consumer(self, index: int) -> None:
         self.consumer_index = index
 
     def complete(self, index: int, layer: int) -> None:
-        self._events[index][layer].set()
+        self.futures[index][layer].set_result(None)
 
     def fail(self, index: int, error: BaseException) -> None:
-        events = self._events.get(index)
-        if events is None:
-            return
-        self._errors[index] = error
-        for event in events:
-            event.set()
+        for future in self.futures.get(index, ()):
+            if not future.done():
+                future.set_exception(error)
 
     def wait_until(self, threshold: int) -> None:
         index = self.consumer_index
-        events = self._events.get(index)
-        if events is None:
+        futures = self.futures.get(index)
+        if futures is None:
             return
-        events[threshold].wait()
-        error = self._errors.get(index)
-        if threshold == self.num_layers - 1:
-            self._events.pop(index, None)
-            self._errors.pop(index, None)
-        if error is not None:
+        try:
+            futures[threshold].result()
+        except BaseException as error:
             raise RuntimeError("Mooncake layer-wise KV load failed.") from error
+        finally:
+            if threshold == self.num_layers - 1:
+                self.futures.pop(index, None)
 
     def reset(self) -> None:
-        self._producer_index = -1
+        self.producer_index = -1
         self.consumer_index = -1
-        self._events.clear()
-        self._errors.clear()
-
-
-@dataclass
-class _LayerRangePlan:
-    name: PoolName
-    pool: Any
-    keys: list[str]
-    locations: list[int]
-
-    def get_layer_meta(self, layer: int):
-        return self.pool.get_prepared_layer_range_meta(self.locations, layer)
+        self.futures.clear()
 
 
 class MooncakeTreeConnector(UnifiedTreeConnector):
@@ -94,7 +77,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         server_args,
         params: CacheInitParams,
         *,
-        _storage=None,
+        storage=None,
     ):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
@@ -124,14 +107,14 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             model_name=server_args.model_path,
             extra_config=extra_config,
         )
-        if _storage is None:
+        if storage is None:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
                 MooncakeStore,
             )
 
             self.storage = MooncakeStore(storage_config, mem_pool=None)
         else:
-            self.storage = _storage
+            self.storage = storage
         self.storage.mem_pool_host = pool_group
         self.storage.registered_pools = self.pools
         rank_suffix = f"tp{tp_rank}_cp{params.attn_cp_rank}_pp{params.pp_rank}"
@@ -145,11 +128,11 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             params.req_to_token_pool.register_layer_transfer_counter(
                 self.layer_done_counter
             )
-        self._pending: dict[str, list[PoolTransfer]] = {}
-        self.load_queue: Queue[tuple[int, list[_LayerRangePlan]] | None] = Queue()
+        self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int] | None] = Queue()
         self.offload_results: Queue[bool] = Queue()
-        self._stats = {"lookup": 0, "load": 0, "offload": 0}
+        self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
@@ -277,7 +260,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 if counts[end] - counts[max(0, end - window)]
                 == end - max(0, end - window)
             ]
-        self._stats["lookup"] += 1
+        self.stats["lookup"] += 1
         if valid:
             logger.info(
                 "Unified tree Mooncake lookup hit: rid=%s pages=%d candidates=%d",
@@ -291,24 +274,23 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self._expand(transfers)
         if not expanded:
             return False
-        if rid in self._pending:
+        if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
-        self._pending[rid] = expanded
+        self.pending_loads[rid] = expanded
         return True
 
     def cancel_queued_load(self, rid: str) -> None:
-        self._pending.pop(rid, None)
+        self.pending_loads.pop(rid, None)
 
     def start_layer_wise_loading(self) -> int:
-        if not self._pending:
+        if not self.pending_loads:
             return -1
-        pending = self._pending
-        self._pending = {}
+        pending = self.pending_loads
+        self.pending_loads = {}
 
-        plans = self._build_range_plans(list(pending.values()))
         counter_index = self.layer_done_counter.update_producer()
-        self.load_queue.put((counter_index, plans))
-        self._stats["load"] += len(pending)
+        self.load_queue.put((counter_index, list(pending.values())))
+        self.stats["load"] += len(pending)
         return counter_index
 
     def load_thread_func(self) -> None:
@@ -317,52 +299,39 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                counter_index, plans = task
-                self._run_layer_wise_batch(counter_index, plans)
+                counter_index, transfers = task
+                self._run_layer_wise_batch(counter_index, transfers)
             finally:
                 self.load_queue.task_done()
 
     def _build_range_plans(
         self, request_transfers: list[list[PoolTransfer]]
-    ) -> list[_LayerRangePlan]:
-        grouped: dict[PoolName, list[PoolTransfer]] = {}
+    ) -> dict[PoolName, tuple[list[str], list[int]]]:
+        plans: dict[PoolName, tuple[list[str], list[int]]] = {}
         for transfers in request_transfers:
             for transfer in transfers:
-                grouped.setdefault(transfer.name, []).append(transfer)
-
-        plans = []
-        for name, transfers in grouped.items():
-            keys = []
-            locations = []
-            for transfer in transfers:
+                keys, locations = plans.setdefault(transfer.name, ([], []))
                 component_keys, multiplier = (
                     self.storage._get_hybrid_page_component_keys(
                         list(transfer.keys), transfer
                     )
                 )
                 keys.extend(self.storage._tag_keys(component_keys))
-                transfer_locations = self.pools[name].prepare_locations(
+                transfer_locations = self.pools[transfer.name].prepare_locations(
                     transfer.host_indices
                 )
                 if len(transfer_locations) * multiplier != len(component_keys):
                     raise ValueError(
-                        f"Layer-wise Mooncake pool {name} has "
+                        f"Layer-wise Mooncake pool {transfer.name} has "
                         f"{len(component_keys)} component keys for "
                         f"{len(transfer_locations)} destination pages."
                     )
                 locations.extend(transfer_locations)
-            if not locations or not keys:
+        for name, (keys, locations) in plans.items():
+            if not keys or not locations:
                 raise ValueError(
                     f"Layer-wise Mooncake pool {name} has no destinations."
                 )
-            plans.append(
-                _LayerRangePlan(
-                    name=name,
-                    pool=self.pools[name],
-                    keys=keys,
-                    locations=locations,
-                )
-            )
         return plans
 
     @staticmethod
@@ -376,52 +345,53 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             value == 0 for value in values
         )
 
-    @staticmethod
-    def _range_result_ok(result: Any, sizes: list[list[int]]) -> bool:
-        if result is None or isinstance(result, int):
-            return False
-        return list(result) == [sum(key_sizes) for key_sizes in sizes]
-
     def _run_layer_wise_batch(
-        self, counter_index: int, plans: list[_LayerRangePlan]
+        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
-        started: list[_LayerRangePlan] = []
+        started: list[tuple[PoolName, list[str]]] = []
         try:
-            for plan in plans:
-                result = self.storage.store.batch_get_session_start(plan.keys)
-                if not self._status_ok(result, len(plan.keys)):
-                    raise RuntimeError(
-                        f"Mooncake session start failed for pool {plan.name}: {result}"
-                    )
-                started.append(plan)
-
+            plans = self._build_range_plans(request_transfers)
             if not plans:
                 raise ValueError("Layer-wise Mooncake load has no page keys.")
+            for name, (keys, _) in plans.items():
+                result = self.storage.store.batch_get_session_start(keys)
+                if not self._status_ok(result, len(keys)):
+                    raise RuntimeError(
+                        f"Mooncake session start failed for pool {name}: {result}"
+                    )
+                started.append((name, keys))
 
             for layer in range(self.num_layers):
                 active = False
-                for plan in plans:
-                    meta = plan.get_layer_meta(layer)
+                for name, (keys, locations) in plans.items():
+                    meta = self.pools[name].get_prepared_layer_range_meta(
+                        locations, layer
+                    )
                     if meta is None:
                         continue
                     active = True
                     ptrs, sizes, offsets = meta
-                    if len(ptrs) != len(plan.keys):
+                    if len(ptrs) != len(keys):
                         raise ValueError(
-                            f"Mooncake pool={plan.name}, layer={layer} produced "
-                            f"{len(ptrs)} ranges for {len(plan.keys)} keys."
+                            f"Mooncake pool={name}, layer={layer} produced "
+                            f"{len(ptrs)} ranges for {len(keys)} keys."
                         )
                     result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        plan.keys,
+                        keys,
                         ptrs,
                         sizes,
                         offsets,
                     )
-                    if not self._range_result_ok(result, sizes):
+                    expected = [sum(item) for item in sizes]
+                    if (
+                        result is None
+                        or isinstance(result, int)
+                        or list(result) != expected
+                    ):
                         raise RuntimeError(
-                            f"Mooncake range get failed for pool={plan.name}, "
+                            f"Mooncake range get failed for pool={name}, "
                             f"layer={layer}: transferred={result}, "
-                            f"expected={[sum(item) for item in sizes]}"
+                            f"expected={expected}"
                         )
                 if not active:
                     raise ValueError(
@@ -432,13 +402,12 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for plan in started:
+            for name, keys in started:
                 try:
-                    result = self.storage.store.batch_get_session_end(plan.keys)
+                    result = self.storage.store.batch_get_session_end(keys)
                     if not self._status_ok(result):
                         raise RuntimeError(
-                            f"Mooncake session end failed for pool "
-                            f"{plan.name}: {result}"
+                            f"Mooncake session end failed for pool {name}: {result}"
                         )
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
@@ -464,8 +433,8 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 results = self.storage.batch_set_v2(expanded)
                 success = self._all_succeeded(results, expanded)
                 if success:
-                    self._stats["offload"] += 1
-                    if self._stats["offload"] == 1:
+                    self.stats["offload"] += 1
+                    if self.stats["offload"] == 1:
                         logger.info("Unified tree Mooncake offload: tokens=%d", tokens)
                 self.offload_results.put(success)
             except BaseException:
@@ -494,7 +463,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             torch.cuda.synchronize(device)
 
     def reset(self) -> None:
-        self._pending.clear()
+        self.pending_loads.clear()
         self.load_queue.join()
         self.offload_queue.join()
         while True:
@@ -510,5 +479,5 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.offload_queue.put(None)
         self.load_thread.join()
         self.offload_thread.join()
-        logger.info("Unified tree Mooncake stats: %s", self._stats)
+        logger.info("Unified tree Mooncake stats: %s", self.stats)
         self.storage.close()

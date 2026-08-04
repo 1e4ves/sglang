@@ -96,7 +96,7 @@ def test_lookup_returns_sparse_mamba_boundaries():
         PoolName.KV: identity_pool,
         PoolName.MAMBA: identity_pool,
     }
-    connector._stats = {"lookup": 0}
+    connector.stats = {"lookup": 0}
     connector._page_exists = lambda keys, transfer: (
         [True, True, True, True]
         if transfer.name == PoolName.KV
@@ -141,7 +141,7 @@ def test_offload_runs_on_background_thread():
     connector.sources = {PoolName.KV: PoolName.KV}
     connector.pools = {PoolName.KV: pool}
     connector.storage = _Storage()
-    connector._stats = {"lookup": 0, "load": 0, "offload": 0}
+    connector.stats = {"lookup": 0, "load": 0, "offload": 0}
     connector.offload_queue = Queue()
     connector.offload_results = Queue()
     connector.offload_thread = threading.Thread(
