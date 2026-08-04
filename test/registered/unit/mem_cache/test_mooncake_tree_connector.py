@@ -13,12 +13,16 @@ from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import 
     _build_hybrid_linear_pools,
     _MappedRowsPool,
 )
+from sglang.srt.mem_cache.unified_cache_components import ComponentType
 from sglang.srt.mem_cache.unified_cache_components.mamba_component import (
     MambaComponent,
 )
 from sglang.srt.mem_cache.unified_cache_components.swa_component import SWAComponent
 from sglang.srt.mem_cache.unified_cache_components.tree_component import (
     ConnectorTransferPhase,
+)
+from sglang.srt.mem_cache.unified_cache_connector_mixin import (
+    UnifiedCacheConnectorMixin,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
 
@@ -242,3 +246,48 @@ def test_mamba_connector_load_allocates_cache_and_request_slots():
     failed = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([9, 10]))
     component.finish_connector_load(req, full, failed, prefix_len=2, success=False)
     assert allocator.freed[-1].tolist() == [9, 10]
+
+
+def test_overlapping_load_retargets_freed_slots_to_tree_values():
+    mixin = UnifiedCacheConnectorMixin()
+    mixin.token_to_kv_pool_allocator = SimpleNamespace(
+        translate_loc_from_full_to_swa=lambda indices: indices + 1000
+    )
+    queued = {"second": ["stale"]}
+
+    def load(rid, transfers):
+        queued[rid] = list(transfers)
+        return True
+
+    mixin.connector = SimpleNamespace(
+        cancel_queued_load=lambda rid: queued.pop(rid),
+        load=load,
+    )
+
+    full = PoolTransfer(
+        name=PoolName.KV, device_indices=torch.tensor([100, 101, 102, 103])
+    )
+    swa = PoolTransfer(name=PoolName.SWA, device_indices=torch.tensor([200, 201]))
+    mamba = PoolTransfer(name=PoolName.MAMBA, device_indices=torch.tensor([300, 301]))
+    canonical_full = torch.tensor([10, 11, 12, 13])
+    loaded = SimpleNamespace(
+        device_indices=torch.cat([torch.tensor([1, 2]), canonical_full]),
+        last_device_node=SimpleNamespace(
+            component_data={
+                ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([30]))
+            }
+        ),
+    )
+
+    returned = mixin._retarget_connector_load(
+        "second",
+        [full, swa, mamba],
+        loaded,
+        device_hit_len=2,
+    )
+
+    assert returned.tolist() == canonical_full.tolist()
+    assert full.device_indices.tolist() == canonical_full.tolist()
+    assert swa.device_indices.tolist() == [1012, 1013]
+    assert mamba.device_indices.tolist() == [30, 301]
+    assert queued["second"] == [full, swa, mamba]

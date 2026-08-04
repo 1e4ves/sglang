@@ -291,11 +291,56 @@ class UnifiedCacheConnectorMixin:
 
         # Rematch
         loaded = self.match_prefix(MatchPrefixParams(key=marker.key))
+        canonical_full_indices = self._retarget_connector_load(
+            req.rid,
+            transfers,
+            loaded,
+            device_hit_len,
+        )
         node = loaded.last_device_node
         while node is not req.last_node:
             node.connector_offloaded = True
             node = node.parent
-        return full.device_indices, loaded.last_device_node
+        return canonical_full_indices, loaded.last_device_node
+
+    def _retarget_connector_load(
+        self,
+        rid: str,
+        transfers: list[PoolTransfer],
+        loaded: MatchResult,
+        device_hit_len: int,
+    ) -> torch.Tensor:
+        """Retarget a queued load to the slots retained by ``insert``."""
+        canonical_full = loaded.device_indices[device_hit_len:]
+        for transfer in transfers:
+            if transfer.name == PoolName.KV:
+                transfer.device_indices = canonical_full
+            elif transfer.name == PoolName.SWA:
+                swa_len = transfer.device_indices.numel()
+                transfer.device_indices = (
+                    self.token_to_kv_pool_allocator.translate_loc_from_full_to_swa(
+                        canonical_full[-swa_len:]
+                    ).to(torch.int64)
+                )
+            else:
+                assert transfer.name == PoolName.MAMBA
+                canonical_mamba = loaded.last_device_node.component_data[
+                    ComponentType.MAMBA
+                ].value
+                assert canonical_mamba is not None
+                transfer.device_indices = torch.cat(
+                    [
+                        canonical_mamba.to(transfer.device_indices),
+                        transfer.device_indices[1:],
+                    ]
+                )
+
+        self.connector.cancel_queued_load(rid)
+        if not self.connector.load(rid, transfers):
+            raise RuntimeError(
+                f"Failed to requeue canonical connector load for {rid=}."
+            )
+        return canonical_full
 
     # ---- offload: device -> remote, driven by the write-through chain ----
 
