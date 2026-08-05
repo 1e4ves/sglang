@@ -122,6 +122,7 @@ class PoolTransferResult:
 
     kv_hit_pages: int
     extra_pool_hit_pages: dict[str, int]
+    valid_pages: Optional[List[int]] = None
 
     @classmethod
     def empty(cls) -> PoolTransferResult:

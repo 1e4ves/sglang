@@ -1,9 +1,14 @@
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 
 
 class DeepSeekV4PoolMappings(NamedTuple):
@@ -198,6 +203,42 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.kv_buffer = None
+
+    def resolve_transfers(
+        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
+    ) -> list[PoolTransfer]:
+        by_name = {transfer.name: transfer for transfer in transfers}
+        kv = by_name.get(PoolName.KV)
+        if kv is None or not kv.keys:
+            return []
+        if not allow_partial and not set(self.sources.values()) <= set(by_name):
+            return []
+
+        resolved = []
+        for name, source_name in self.sources.items():
+            source = by_name.get(source_name)
+            if source is None:
+                continue
+            indices = source.device_indices
+            resolved.append(
+                replace(
+                    source,
+                    name=name,
+                    host_indices=(
+                        self.entry_map[name].translate_indices(indices)
+                        if indices is not None
+                        else None
+                    ),
+                    keys=list(kv.keys if source_name == PoolName.KV else source.keys),
+                    hit_policy=(
+                        PoolHitPolicy.ALL_PAGES
+                        if source_name == PoolName.KV
+                        else source.hit_policy
+                    ),
+                    indices_from_pool=None,
+                )
+            )
+        return resolved
 
 
 def _state_views(state_pools: Sequence[Any], global_layers: Sequence[int]):

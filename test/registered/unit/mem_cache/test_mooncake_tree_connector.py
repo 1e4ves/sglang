@@ -11,8 +11,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
+    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
     MooncakeTreeConnector,
 )
@@ -87,21 +89,27 @@ def test_sparse_multi_component_layer_ranges():
 
 def test_lookup_returns_sparse_mamba_boundaries():
     connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
-    connector.sources = {
-        PoolName.KV: PoolName.KV,
-        PoolName.MAMBA: PoolName.MAMBA,
-    }
-    identity_pool = SimpleNamespace(translate_indices=lambda indices: indices)
-    connector.pools = {
-        PoolName.KV: identity_pool,
-        PoolName.MAMBA: identity_pool,
-    }
+    pools = [
+        SimpleNamespace(
+            name=name,
+            indices_from_pool=name,
+            translate_indices=lambda indices: indices,
+        )
+        for name in (PoolName.KV, PoolName.MAMBA)
+    ]
+    connector.pool_group = DevicePoolGroup(pools, num_layers=4, page_size=1)
+    connector.pools = connector.pool_group.entry_map
     connector.stats = {"lookup": 0}
-    connector._page_exists = lambda keys, transfer: (
-        [True, True, True, True]
-        if transfer.name == PoolName.KV
-        else [False, True, False, True]
+    connector.storage = MooncakeStore.__new__(MooncakeStore)
+    connector.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    connector.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+        [f"{key}_{transfer.name}" for key in keys],
+        1,
     )
+    connector.storage._tag_keys = lambda keys: keys
+    connector.storage._batch_exist = lambda keys: [
+        int(key.endswith("_kv") or key[0] in ("b", "d")) for key in keys
+    ]
 
     valid = connector.lookup(
         "rid",
@@ -133,13 +141,15 @@ def test_offload_runs_on_background_thread():
             }
 
     pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
         translate_indices=lambda indices: indices,
         get_hybrid_pool_buffer=lambda: [],
     )
     connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
     connector.page_size = 2
-    connector.sources = {PoolName.KV: PoolName.KV}
-    connector.pools = {PoolName.KV: pool}
+    connector.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=2)
+    connector.pools = connector.pool_group.entry_map
     connector.storage = _Storage()
     connector.stats = {"lookup": 0, "load": 0, "offload": 0}
     connector.offload_queue = Queue()
