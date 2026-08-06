@@ -14,6 +14,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_tree_connector
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
     MooncakeTreeConnector,
@@ -125,14 +126,25 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
-def test_offload_runs_on_background_thread():
+def test_offload_runs_on_background_thread(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     caller_thread = threading.get_ident()
     worker_threads = []
+    event_calls = []
+
+    class _Event:
+        def record(self):
+            event_calls.append("record")
+
+        def synchronize(self):
+            event_calls.append("synchronize")
+
+    monkeypatch.setattr(mooncake_tree_connector.device_module, "Event", _Event)
 
     class _Storage:
         def batch_set_v2(self, transfers):
+            assert event_calls == ["record", "synchronize"]
             worker_threads.append(threading.get_ident())
             started.set()
             assert release.wait(timeout=5)

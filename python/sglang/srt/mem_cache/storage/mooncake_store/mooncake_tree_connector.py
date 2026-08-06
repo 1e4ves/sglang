@@ -20,8 +20,10 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
+from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
+device_module = get_device_module()
 
 
 class LayerWiseLoadCounter:
@@ -117,7 +119,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.storage.mla_suffix = rank_suffix
         self.storage.mha_suffix = rank_suffix
 
-        self._register_buffers()
+        self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -125,7 +127,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int] | None] = Queue()
+        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
+            Queue()
+        )
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -141,7 +145,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         )
         self.offload_thread.start()
 
-    def _register_buffers(self) -> None:
+    def register_buffers(self) -> None:
         seen = set()
         for pool in self.pools.values():
             for buffer in pool.get_hybrid_pool_buffer():
@@ -156,14 +160,6 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                         "Failed to register GPU KV buffer with Mooncake, "
                         f"error code: {result}."
                     )
-
-    @staticmethod
-    def _all_succeeded(results: dict, transfers: list[PoolTransfer]) -> bool:
-        return bool(results) and all(
-            len(results.get(transfer.name, ())) == len(transfer.keys)
-            and all(results[transfer.name])
-            for transfer in transfers
-        )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -285,7 +281,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             return False
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
-        self.offload_queue.put((expanded, tokens))
+        ready_event = device_module.Event()
+        ready_event.record()
+        self.offload_queue.put((expanded, tokens, ready_event))
         return True
 
     def offload_thread_func(self) -> None:
@@ -294,10 +292,10 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                expanded, tokens = task
-                self._wait_for_device()
+                expanded, tokens, ready_event = task
+                ready_event.synchronize()
                 results = self.storage.batch_set_v2(expanded)
-                success = self._all_succeeded(results, expanded)
+                success = all(all(pool_results) for pool_results in results.values())
                 if success:
                     self.stats["offload"] += 1
                     if self.stats["offload"] == 1:
@@ -314,19 +312,6 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
 
     def pop_completed_offload(self) -> bool:
         return self.offload_results.get_nowait()
-
-    def _wait_for_device(self) -> None:
-        device = next(
-            (
-                buffer.device
-                for pool in self.pools.values()
-                for buffer in pool.get_hybrid_pool_buffer()
-                if buffer.device.type == "cuda"
-            ),
-            None,
-        )
-        if device is not None:
-            torch.cuda.synchronize(device)
 
     def reset(self) -> None:
         self.pending_loads.clear()

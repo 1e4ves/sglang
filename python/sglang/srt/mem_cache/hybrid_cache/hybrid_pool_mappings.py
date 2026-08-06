@@ -207,6 +207,17 @@ class DevicePoolGroup:
     def resolve_transfers(
         self, transfers: list[PoolTransfer], *, allow_partial: bool = False
     ) -> list[PoolTransfer]:
+        """Map logical cache transfers to Mooncake's physical device pools.
+
+        Cache components emit logical KV/SWA/MAMBA transfers, while Mooncake
+        operates on every registered DevicePoolEntry. For example, DeepSeek V4
+        C4/C128 pools reuse the KV transfer's page keys and indices, and its
+        state pools reuse the SWA transfer. This method creates one transfer per
+        physical pool and translates the source indices into that pool's rows.
+
+        Lookup and load require every source pool. Offload passes
+        ``allow_partial=True`` because a cache node may contain only some pools.
+        """
         by_name = {transfer.name: transfer for transfer in transfers}
         kv = by_name.get(PoolName.KV)
         if kv is None or not kv.keys:
