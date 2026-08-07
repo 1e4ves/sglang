@@ -126,6 +126,25 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
+def test_layer_wise_loading_freezes_gc_once(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mooncake_tree_connector, "freeze_gc", calls.append)
+
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.gc_frozen = False
+    connector.pending_loads = {"first": [object()]}
+    connector.layer_done_counter = SimpleNamespace(update_producer=lambda: 3)
+    connector.load_queue = Queue()
+    connector.stats = {"load": 0}
+
+    assert connector.start_layer_wise_loading() == 3
+    connector.pending_loads = {"second": [object()]}
+    assert connector.start_layer_wise_loading() == 3
+
+    assert calls == ["Mooncake connector"]
+    assert connector.stats["load"] == 2
+
+
 def test_offload_runs_on_background_thread(monkeypatch):
     started = threading.Event()
     release = threading.Event()

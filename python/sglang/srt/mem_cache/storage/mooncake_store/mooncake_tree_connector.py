@@ -20,7 +20,7 @@ from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     resolve_hybrid_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache_connector_mixin import UnifiedTreeConnector
-from sglang.srt.utils import get_device_module
+from sglang.srt.utils import freeze_gc, get_device_module
 
 logger = logging.getLogger(__name__)
 device_module = get_device_module()
@@ -126,6 +126,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self.gc_frozen = False
         self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
@@ -196,6 +197,11 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
     def start_layer_wise_loading(self) -> int:
         if not self.pending_loads:
             return -1
+        if not self.gc_frozen:
+            # Range metadata creates many short-lived lists. A cyclic GC scan
+            # of the mature model graph stalls one TP rank and its NCCL peers.
+            freeze_gc("Mooncake connector")
+            self.gc_frozen = True
         pending = self.pending_loads
         self.pending_loads = {}
 
