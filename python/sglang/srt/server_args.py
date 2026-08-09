@@ -2500,6 +2500,14 @@ class ServerArgs:
         "Enable direct external storage through UnifiedRadixCache without a host cache tier.",
         NS("memory"),
     ] = False
+    unified_tree_connector_load_strategy: A[
+        str,
+        Arg(
+            help="The load strategy for the unified tree connector.",
+            choices=["layer_wise", "prefetch"],
+        ),
+        NS("memory"),
+    ] = "layer_wise"
     hicache_ratio: A[
         float,
         "The ratio of the size of host KV cache memory pool to the size of device pool.",

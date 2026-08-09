@@ -120,6 +120,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.storage.mha_suffix = rank_suffix
 
         self.register_buffers()
+        self.load_strategy = server_args.unified_tree_connector_load_strategy
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
             params.req_to_token_pool.register_layer_transfer_counter(
@@ -127,7 +128,9 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[tuple[int, list[list[PoolTransfer]]] | None] = Queue()
+        self.load_queue: Queue[tuple[int | Future, list[list[PoolTransfer]]] | None] = (
+            Queue()
+        )
         self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
             Queue()
         )
@@ -136,7 +139,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.load_thread = threading.Thread(
             target=self.load_thread_func,
             daemon=True,
-            name=f"mooncake-layerwise-tp{tp_rank}",
+            name=f"mooncake-{self.load_strategy}-tp{tp_rank}",
         )
         self.load_thread.start()
         self.offload_thread = threading.Thread(
@@ -186,6 +189,13 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self.pool_group.resolve_transfers(transfers)
         if not expanded:
             return False
+        if self.load_strategy == "prefetch":
+            self.freeze_gc_once()
+            completed = Future()
+            self.load_queue.put((completed, [expanded]))
+            success = completed.result()
+            self.stats["load"] += 1
+            return success
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
         self.pending_loads[rid] = expanded
@@ -194,14 +204,18 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
     def cancel_queued_load(self, rid: str) -> None:
         self.pending_loads.pop(rid, None)
 
+    def freeze_gc_once(self) -> None:
+        if self.gc_frozen:
+            return
+        # Transfer metadata creates many short-lived lists. Keep the mature
+        # model graph out of cyclic GC scans before load or offload traffic.
+        freeze_gc("Mooncake connector")
+        self.gc_frozen = True
+
     def start_layer_wise_loading(self) -> int:
         if not self.pending_loads:
             return -1
-        if not self.gc_frozen:
-            # Range metadata creates many short-lived lists. A cyclic GC scan
-            # of the mature model graph stalls one TP rank and its NCCL peers.
-            freeze_gc("Mooncake connector")
-            self.gc_frozen = True
+        self.freeze_gc_once()
         pending = self.pending_loads
         self.pending_loads = {}
 
@@ -216,10 +230,23 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
             try:
                 if task is None:
                     return
-                counter_index, transfers = task
-                self.load_layer_wise(counter_index, transfers)
+                completion, transfers = task
+                if isinstance(completion, Future):
+                    try:
+                        completion.set_result(self.load_prefetch(transfers[0]))
+                    except BaseException:
+                        logger.exception("Mooncake prefetch failed")
+                        completion.set_result(False)
+                else:
+                    self.load_layer_wise(completion, transfers)
             finally:
                 self.load_queue.task_done()
+
+    def load_prefetch(self, transfers: list[PoolTransfer]) -> bool:
+        results = self.storage.batch_get_v2(transfers)
+        return len(results) == len(transfers) and all(
+            all(pool_results) for pool_results in results.values()
+        )
 
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
@@ -285,6 +312,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True)
         if not expanded:
             return False
+        self.freeze_gc_once()
         kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
         tokens = len(kv.keys) * self.page_size
         ready_event = device_module.Event()

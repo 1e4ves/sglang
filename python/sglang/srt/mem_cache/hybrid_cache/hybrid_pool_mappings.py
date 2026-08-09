@@ -103,15 +103,27 @@ class DevicePoolEntry:
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 
+        self.buffer_meta = [
+            [
+                (
+                    buffer.data_ptr(),
+                    buffer.stride(0) * buffer.element_size(),
+                    buffer.nbytes // buffer.shape[0] * self._row_span,
+                )
+                for buffer in component
+            ]
+            for component in self.components
+        ]
+
         self._component_offsets = []
         offset = 0
-        for component in self.components:
+        for component in self.buffer_meta:
             if not packed:
                 offset = 0
             offsets = []
-            for buffer in component:
+            for _, _, size in component:
                 offsets.append(offset)
-                offset += buffer[0].nbytes * self._row_span
+                offset += size
             self._component_offsets.append(offsets)
 
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
@@ -152,9 +164,17 @@ class DevicePoolEntry:
 
     def get_page_buffer_meta(self, indices: torch.Tensor):
         rows = self._rows(indices)
-        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
+        ptrs = [
+            base_ptr + row * row_stride
+            for row in rows
+            for component in self.buffer_meta
+            for base_ptr, row_stride, _ in component
+        ]
         sizes = [
-            buffer[0].nbytes * self._row_span for _ in rows for buffer in self.kv_buffer
+            size
+            for _ in rows
+            for component in self.buffer_meta
+            for _, _, size in component
         ]
         return ptrs, sizes
 
@@ -167,17 +187,17 @@ class DevicePoolEntry:
             return None
 
         items = []
-        for component, offsets in zip(self.components, self._component_offsets):
-            buffer = component[buffer_index]
-            items.append(
-                (buffer, buffer[0].nbytes * self._row_span, offsets[buffer_index])
-            )
+        for component, offsets in zip(self.buffer_meta, self._component_offsets):
+            base_ptr, row_stride, size = component[buffer_index]
+            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
-            row_ptrs = [buffer[row].data_ptr() for buffer, _, _ in items]
-            row_sizes = [size for _, size, _ in items]
-            row_offsets = [offset for _, _, offset in items]
+            row_ptrs = [
+                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
+            ]
+            row_sizes = [size for _, _, size, _ in items]
+            row_offsets = [offset for _, _, _, offset in items]
             if self.packed:
                 ptrs.append(row_ptrs)
                 sizes.append(row_sizes)
