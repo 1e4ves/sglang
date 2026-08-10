@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeComponentDeviceSlot,
     FreeDeviceKV,
+    OffloadConnector,
     ReplaceWriteThroughOnNodeSplit,
 )
 
@@ -63,6 +64,10 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedLRUList,
     UnifiedTreeCore,
     UnifiedTreeNode,
+)
+from sglang.srt.mem_cache.unified_cache_connector_mixin import (
+    UnifiedCacheConnectorMixin,
+    UnifiedTreeConnector,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -130,7 +135,7 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(BasePrefixCache):
+class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -221,6 +226,7 @@ class UnifiedRadixCache(BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
+        self.connector: Optional[UnifiedTreeConnector] = None
 
         self.reset()
         logger.info(
@@ -299,8 +305,11 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
+        if self.connector is not None:
+            self.connector.reset()
         self.tree_core.reset()
         self.session_refs.reset()
+        self.reset_connector_state()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -406,6 +415,7 @@ class UnifiedRadixCache(BasePrefixCache):
             self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
+        self.close_connector()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -423,6 +433,11 @@ class UnifiedRadixCache(BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
+        if self.connector is not None and params.req is not None:
+            key, _ = params.key.maybe_to_bigram_view(self.tree_core.is_eagle)
+            result = self.match_connector(
+                key.page_aligned(self.page_size), params.req, result
+            )
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -884,6 +899,8 @@ class UnifiedRadixCache(BasePrefixCache):
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
             self._execute_and_commit_kv_backup(action)
+        elif isinstance(action, OffloadConnector):
+            self.offload_connector_node(action.node_id)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1519,6 +1536,7 @@ class UnifiedRadixCache(BasePrefixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
+        self.release_connector_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -1974,6 +1992,9 @@ class UnifiedRadixCache(BasePrefixCache):
         assert req is not None
         last_best_match_device_node_id = req.last_node
 
+        if self.connector is not None and req.rid in self._connector_markers:
+            return self.load_connector(req)
+
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
             or params.host_hit_length > 0
@@ -2008,6 +2029,7 @@ class UnifiedRadixCache(BasePrefixCache):
         """Called per scheduler step to poll async HiCache events."""
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
+        self.drain_connector_offloads()
 
         if self.pp_size != 1:
             self.writing_check()
@@ -2047,7 +2069,9 @@ class UnifiedRadixCache(BasePrefixCache):
             )
 
     def ready_to_load_host_cache(self) -> int:
-        """Notify the cache controller to start the KV cache loading."""
+        """Start queued cache loading for the next prefill batch."""
+        if self.connector is not None:
+            return self.connector.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

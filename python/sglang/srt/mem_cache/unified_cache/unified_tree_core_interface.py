@@ -124,6 +124,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     device: torch.device
     enable_hicache: bool
     enable_storage: bool
+    enable_connector: bool
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool

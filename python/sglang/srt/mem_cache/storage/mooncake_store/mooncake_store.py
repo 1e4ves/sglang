@@ -749,7 +749,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Mooncake zips object keys with registered buffer pointers.
         pool_name = transfer.name
         suffixes = []
-        if pool_name == PoolName.MAMBA:
+        if pool_name == PoolName.KV:
+            suffixes = [f"_{self.mla_suffix}_k"]
+        elif pool_name == PoolName.MAMBA:
             # Mamba stores one temporal object plus one object per conv state.
             # conv-only models have no ssm state; drop the 0-element temporal
             # object (mooncake rejects 0-size puts). get_page_buffer_meta drops
@@ -895,7 +897,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             )
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
-            if transfer.name == PoolName.DEEPSEEK_V4_C4:
+            if len(ptr_list) != len(key_strs):
                 ptr_list, element_size_list = self._pack_multi_buffer_meta(
                     key_strs, ptr_list, element_size_list
                 )

@@ -64,6 +64,12 @@ class BackupKV(msgspec.Struct, frozen=True):
     node_ids: list[NodeId]
 
 
+class OffloadConnector(msgspec.Struct, frozen=True):
+    """Offload one tree node through the direct external connector."""
+
+    node_id: NodeId
+
+
 class MambaEvictExcessPathStates(ComponentAction, frozen=True):
     """Per-path Mamba state-cap eviction from the tail's root path; applied at
     the insert's commit barrier, after the walk-time backups whose
@@ -100,4 +106,6 @@ class SWARebuild(ComponentAction, frozen=True):
 
 
 # Cache-owned actions, applied by UnifiedRadixCache itself.
-CacheAction = ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV
+CacheAction = (
+    ReplaceWriteThroughOnNodeSplit | FreeDeviceKV | BackupKV | OffloadConnector
+)

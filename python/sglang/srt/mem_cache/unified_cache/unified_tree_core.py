@@ -47,6 +47,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     CacheAction,
     ComponentAction,
     FreeDeviceKV,
+    OffloadConnector,
     ReplaceWriteThroughOnNodeSplit,
 )
 from sglang.srt.mem_cache.unified_cache.components import (
@@ -123,6 +124,7 @@ class UnifiedTreeNode:
         self.id = UnifiedTreeNode.counter
         UnifiedTreeNode.counter += 1
         self.write_through_pending_id: Optional[int] = None
+        self.connector_offloaded = False
 
     def component(self, component_type: ComponentType) -> ComponentData:
         return self.component_data[component_type]
@@ -383,6 +385,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_eagle = params.is_eagle and ComponentType.MAMBA not in components
         self.enable_hicache = False
         self.enable_storage = False
+        self.enable_connector = False
         self.write_through_threshold = 256
         self.is_write_back = False
         self.has_swa_host_pool = False
@@ -806,20 +809,28 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     continue
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
-    def _inc_hit_count_and_check(
+    def _inc_hit_count_and_build_action(
         self, node: UnifiedTreeNode, chunked: bool = False
-    ) -> bool:
-        """Increment hit count; check whether a write backup should be fired."""
+    ) -> Optional[CacheAction]:
+        """Increment hit count and build the threshold-triggered cache action."""
         if node.evicted or chunked:
-            return False
+            return None
         if self.is_write_back:
-            return False
+            return None
         node.hit_count += 1
-        return (
+        if (
             self.enable_hicache
             and not node.backuped
             and node.hit_count >= self.write_through_threshold
-        )
+        ):
+            return self._build_backup_kv_action(node)
+        if (
+            self.enable_connector
+            and not node.connector_offloaded
+            and node.hit_count >= self.write_through_threshold
+        ):
+            return OffloadConnector(node.id)
+        return None
 
     def begin_insert(self, params: InsertParams) -> InsertStepResult:
         """Start the insert, running to its first barrier or completion."""
@@ -956,8 +967,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKV([value_slice[dup_start:consumed_from]])
                 )
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
-            step_actions.append(self._build_backup_kv_action(node))
+        action = self._inc_hit_count_and_build_action(node, state.params.chunked)
+        if action is not None:
+            step_actions.append(action)
         state.node = node
         state.total_prefix_length += prefix_len
         state.key = key[prefix_len:]
@@ -1005,12 +1017,12 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     LRURefreshPhase.INSERT_END, state.target_node, self.root_node
                 )
 
-        if state.is_new_leaf and self._inc_hit_count_and_check(
-            state.target_node, state.params.chunked
-        ):
-            state.pending_actions.append(
-                self._build_backup_kv_action(state.target_node)
+        if state.is_new_leaf:
+            action = self._inc_hit_count_and_build_action(
+                state.target_node, state.params.chunked
             )
+            if action is not None:
+                state.pending_actions.append(action)
 
     def _split_node(
         self, key: RadixKey, child: UnifiedTreeNode, split_len: int
@@ -1021,6 +1033,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.connector_offloaded = child.connector_offloaded
 
         self._for_each_component_lru(child, UnifiedLRUList.remove_node)
 
@@ -1071,7 +1084,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.component_data[BASE_COMPONENT_TYPE].value = value.clone()
         parent.children[key.child_key(self.page_size)] = new_node
         self.component_evictable_size_[BASE_COMPONENT_TYPE] += len(value)
-        if self.enable_storage:
+        if self.enable_storage or self.enable_connector:
             new_node.hash_value = compute_node_hash_values(new_node, self.page_size)
 
         self._update_evictable_leaf_sets(new_node)

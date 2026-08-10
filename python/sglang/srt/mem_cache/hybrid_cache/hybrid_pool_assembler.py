@@ -12,6 +12,10 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
 )
+from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
+    resolve_deepseek_v4_pool_mappings,
+    resolve_hybrid_linear_pool_mappings,
+)
 from sglang.srt.mem_cache.memory_pool_host import (
     DeepSeekV4PagedHostPool,
     DeepSeekV4StateHostPool,
@@ -373,25 +377,19 @@ def build_deepseek_v4_hicache_stack(
     enable_storage_metrics: bool = False,
 ) -> tuple[HostPoolGroup, HybridCacheController]:
     page_size = params.page_size
-    transfer_layer_num = kvcache.end_layer - kvcache.start_layer
-    full_layer_mapping = {layer_id: layer_id for layer_id in range(transfer_layer_num)}
+    mappings = resolve_deepseek_v4_pool_mappings(kvcache)
+    transfer_layer_num = mappings.num_layers
 
     is_unified_kv = getattr(kvcache, "_unified_kv", False)
     mtp_swa_device_buffers = []
-    if is_unified_kv:
-        # unified_kv keeps the SWA ring inside the unified pool and never offloads it,
-        # so there is no separate SWA host pool to map.
-        swa_layer_mapping = {}
-    else:
+    swa_layer_mapping = mappings.swa.copy()
+    if not is_unified_kv:
         if len(kvcache.swa_kv_pool.kv_buffer) != transfer_layer_num:
             raise ValueError(
                 "DeepSeek V4 SWA KV pool must be PP-stage-local: "
                 f"got {len(kvcache.swa_kv_pool.kv_buffer)} buffers for "
                 f"{transfer_layer_num} local layers"
             )
-        swa_layer_mapping = {
-            layer_id: layer_id for layer_id in range(transfer_layer_num)
-        }
         # Keep every uncompressed draft SWA layer after the target SWA layers.
         # NextN has one layer per pool, while DSpark keeps all stages in one pool.
         mtp_swa_device_buffers = [
@@ -405,25 +403,6 @@ def build_deepseek_v4_hicache_stack(
             target_device_layer_num=transfer_layer_num,
             draft_layer_num=len(mtp_swa_device_buffers),
         )
-
-    c4_layer_mapping = {}
-    c128_layer_mapping = {}
-    c4_state_local_layers = []
-    c4_state_global_layers = []
-    for local_layer_id, layer_item in enumerate(
-        kvcache.layer_mapping[kvcache.start_layer : kvcache.end_layer]
-    ):
-        global_layer_id = kvcache.start_layer + local_layer_id
-        if layer_item.compress_ratio == 4:
-            c4_layer_mapping[local_layer_id] = layer_item.compress_layer_id
-            c4_state_local_layers.append(local_layer_id)
-            c4_state_global_layers.append(global_layer_id)
-        elif layer_item.compress_ratio == 128:
-            c128_layer_mapping[local_layer_id] = layer_item.compress_layer_id
-
-    c4_state_mapping = {
-        layer_id: local_id for local_id, layer_id in enumerate(c4_state_local_layers)
-    }
     num_host_pages, swa_num_host_pages = _deepseek_v4_num_host_pages(
         params=params,
         server_args=server_args,
@@ -440,7 +419,7 @@ def build_deepseek_v4_hicache_stack(
             name=PoolName.KV,
             host_pool=logical_host_pool,
             device_pool=kvcache,
-            layer_mapping=full_layer_mapping,
+            layer_mapping=mappings.full,
             transfer_layer_num=transfer_layer_num,
             is_anchor=True,
         ),
@@ -474,7 +453,7 @@ def build_deepseek_v4_hicache_stack(
             )
         )
 
-    if c4_layer_mapping:
+    if mappings.c4:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
         c4_host_pool = DeepSeekV4PagedHostPool(
             pool_name=str(PoolName.DEEPSEEK_V4_C4),
@@ -503,14 +482,14 @@ def build_deepseek_v4_hicache_stack(
                     name=PoolName.DEEPSEEK_V4_C4,
                     host_pool=c4_host_pool,
                     device_pool=kvcache.c4_kv_pool,
-                    layer_mapping=c4_layer_mapping,
+                    layer_mapping=mappings.c4,
                     transfer_layer_num=transfer_layer_num,
                 ),
                 build_pool_entry(
                     name=PoolName.DEEPSEEK_V4_C4_INDEXER,
                     host_pool=c4_indexer_host_pool,
                     device_pool=kvcache.c4_indexer_kv_pool,
-                    layer_mapping=c4_layer_mapping,
+                    layer_mapping=mappings.c4,
                     transfer_layer_num=transfer_layer_num,
                 ),
             ]
@@ -521,7 +500,7 @@ def build_deepseek_v4_hicache_stack(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_STATE),
                 state_pools=[
                     kvcache.compress_state_pools[layer_id]
-                    for layer_id in c4_state_global_layers
+                    for layer_id in mappings.c4_state_global_layers
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
@@ -532,7 +511,7 @@ def build_deepseek_v4_hicache_stack(
                 pool_name=str(PoolName.DEEPSEEK_V4_C4_INDEXER_STATE),
                 state_pools=[
                     kvcache.indexer_compress_state_pools[layer_id]
-                    for layer_id in c4_state_global_layers
+                    for layer_id in mappings.c4_state_global_layers
                 ],
                 num_host_pages=swa_num_host_pages,
                 swa_page_size=kvcache.swa_page_size,
@@ -545,20 +524,20 @@ def build_deepseek_v4_hicache_stack(
                         name=PoolName.DEEPSEEK_V4_C4_STATE,
                         host_pool=c4_state_host_pool,
                         device_pool=None,
-                        layer_mapping=c4_state_mapping,
+                        layer_mapping=mappings.c4_state,
                         transfer_layer_num=transfer_layer_num,
                     ),
                     build_pool_entry(
                         name=PoolName.DEEPSEEK_V4_C4_INDEXER_STATE,
                         host_pool=c4_indexer_state_host_pool,
                         device_pool=None,
-                        layer_mapping=c4_state_mapping,
+                        layer_mapping=mappings.c4_state,
                         transfer_layer_num=transfer_layer_num,
                     ),
                 ]
             )
 
-    if c128_layer_mapping:
+    if mappings.c128:
         c128_device_buffers, c128_item_bytes = _dsv4_compressed_region_buffers(
             kvcache, 128
         )
@@ -579,7 +558,7 @@ def build_deepseek_v4_hicache_stack(
                     name=PoolName.DEEPSEEK_V4_C128,
                     host_pool=c128_host_pool,
                     device_pool=kvcache.c128_kv_pool,
-                    layer_mapping=c128_layer_mapping,
+                    layer_mapping=mappings.c128,
                     transfer_layer_num=transfer_layer_num,
                 ),
             ]
@@ -1213,15 +1192,16 @@ class _MambaStrategy(StackStrategy):
     ):
         from sglang.srt.mem_cache.base_prefix_cache import EvictParams
 
-        full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        mappings = resolve_hybrid_linear_pool_mappings(
+            kvcache, params.req_to_token_pool
+        )
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
             kv_pool=kvcache.full_kv_pool,
             mamba_pool=params.req_to_token_pool.mamba_pool,
-            full_layer_mapping=full_layer_mapping,
-            mamba_layer_mapping=mamba_layer_mapping,
+            full_layer_mapping=mappings.full,
+            mamba_layer_mapping=mappings.mamba,
             load_cache_event=load_cache_event,
             storage_backend=storage_backend,
             use_mla=kvcache.use_mla,
@@ -1240,7 +1220,7 @@ class _MambaStrategy(StackStrategy):
                 ComponentType.MAMBA: host_pool_group.get_pool(PoolName.MAMBA),
             },
             register_req_to_token_counter=True,
-            transfer_layer_num=len(full_layer_mapping | mamba_layer_mapping),
+            transfer_layer_num=len(mappings.full | mappings.mamba),
             pools_desc="KV + MAMBA",
         )
 
@@ -1902,15 +1882,16 @@ def attach_hybrid_pool_to_mamba_cache(
     try:
         hybrid_kv = mamba_cache.hybrid_kv_cache
         kvcache = mamba_cache.kvcache
-        full_layer_mapping = dict(hybrid_kv.full_attention_layer_id_mapping)
-        mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+        mappings = resolve_hybrid_linear_pool_mappings(
+            hybrid_kv, params.req_to_token_pool
+        )
         host_pool_group, cache_controller = build_hybrid_mamba_stack(
             params=params,
             server_args=server_args,
             kv_pool=kvcache,
             mamba_pool=params.req_to_token_pool.mamba_pool,
-            full_layer_mapping=full_layer_mapping,
-            mamba_layer_mapping=mamba_layer_mapping,
+            full_layer_mapping=mappings.full,
+            mamba_layer_mapping=mappings.mamba,
             load_cache_event=load_cache_event,
             storage_backend=server_args.hicache_storage_backend,
             use_mla=hybrid_kv.use_mla,
@@ -1923,7 +1904,7 @@ def attach_hybrid_pool_to_mamba_cache(
         )
         mamba_cache.full_kv_pool_host = host_pool_group.get_pool(PoolName.KV)
         mamba_cache.mamba_pool_host = host_pool_group.get_pool(PoolName.MAMBA)
-        mamba_cache.transfer_layer_num = len(full_layer_mapping | mamba_layer_mapping)
+        mamba_cache.transfer_layer_num = len(mappings.full | mappings.mamba)
         mamba_cache.host_pool_group = host_pool_group
         mamba_cache.cache_controller = cache_controller
         params.req_to_token_pool.register_layer_transfer_counter(
