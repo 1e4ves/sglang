@@ -7153,10 +7153,12 @@ class ServerArgs:
                     "--hicache-storage-backend."
                 )
             if (self.speculative_algorithm or "").upper() not in ("", "NGRAM"):
-                raise NotImplementedError(
-                    "--enable-unified-tree-connector does not yet support "
-                    "model-based speculative decoding because draft KV pools "
-                    "are not transferred."
+                logger.warning(
+                    "--enable-unified-tree-connector with speculative algorithm "
+                    "%s restores target KV only; draft KV pools are not transferred. "
+                    "Remote cache hits may reduce draft acceptance rate or cause "
+                    "draft-side instability.",
+                    self.speculative_algorithm,
                 )
             return
 
