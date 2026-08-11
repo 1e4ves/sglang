@@ -10,8 +10,11 @@ from sglang.srt.mem_cache.hicache_storage import (
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_mappings import (
     DevicePoolEntry,
+    DevicePoolGroup,
     resolve_hybrid_device_pool_group,
 )
+from sglang.srt.mem_cache.storage.mooncake_store import mooncake_tree_connector
+from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import MooncakeStore
 from sglang.srt.mem_cache.storage.mooncake_store.mooncake_tree_connector import (
     MooncakeTreeConnector,
 )
@@ -74,33 +77,46 @@ def test_sparse_multi_component_layer_ranges():
     locations = pool.prepare_locations(indices)
     assert locations == [0, 4]
     pointers, sizes = pool.get_page_buffer_meta(indices)
-    assert len(pointers) == 8
+    assert pointers == [
+        buffer[row].data_ptr() for row in locations for buffer in (k0, k2, v0, v2)
+    ]
     assert sizes == [6, 10, 14, 22] * 2
     assert pool.get_prepared_layer_range_meta(locations, 1) is None
 
     pointers, sizes, offsets = pool.get_prepared_layer_range_meta(locations, 2)
-    assert len(pointers) == 4
+    assert pointers == [
+        [k2[0].data_ptr()],
+        [v2[0].data_ptr()],
+        [k2[4].data_ptr()],
+        [v2[4].data_ptr()],
+    ]
     assert sizes == [[10], [22], [10], [22]]
     assert offsets == [[6], [14], [6], [14]]
 
 
 def test_lookup_returns_sparse_mamba_boundaries():
     connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
-    connector.sources = {
-        PoolName.KV: PoolName.KV,
-        PoolName.MAMBA: PoolName.MAMBA,
-    }
-    identity_pool = SimpleNamespace(translate_indices=lambda indices: indices)
-    connector.pools = {
-        PoolName.KV: identity_pool,
-        PoolName.MAMBA: identity_pool,
-    }
+    pools = [
+        SimpleNamespace(
+            name=name,
+            indices_from_pool=name,
+            translate_indices=lambda indices: indices,
+        )
+        for name in (PoolName.KV, PoolName.MAMBA)
+    ]
+    connector.pool_group = DevicePoolGroup(pools, num_layers=4, page_size=1)
+    connector.pools = connector.pool_group.entry_map
     connector.stats = {"lookup": 0}
-    connector._page_exists = lambda keys, transfer: (
-        [True, True, True, True]
-        if transfer.name == PoolName.KV
-        else [False, True, False, True]
+    connector.storage = MooncakeStore.__new__(MooncakeStore)
+    connector.storage.mem_pool_host = SimpleNamespace(kv_buffer=None)
+    connector.storage._get_hybrid_page_component_keys = lambda keys, transfer: (
+        [f"{key}_{transfer.name}" for key in keys],
+        1,
     )
+    connector.storage._tag_keys = lambda keys: keys
+    connector.storage._batch_exist = lambda keys: [
+        int(key.endswith("_kv") or key[0] in ("b", "d")) for key in keys
+    ]
 
     valid = connector.lookup(
         "rid",
@@ -116,14 +132,115 @@ def test_lookup_returns_sparse_mamba_boundaries():
     assert valid == [2, 4]
 
 
-def test_offload_runs_on_background_thread():
+def test_load_and_offload_share_gc_freeze(monkeypatch):
+    calls = []
+    monkeypatch.setattr(mooncake_tree_connector, "freeze_gc", calls.append)
+    monkeypatch.setattr(
+        mooncake_tree_connector.device_module,
+        "Event",
+        lambda: SimpleNamespace(record=lambda: None),
+    )
+
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    connector.page_size = 2
+    connector.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=2)
+    connector.gc_frozen = False
+    connector.offload_queue = Queue()
+    connector.pending_loads = {"first": [object()]}
+    connector.layer_done_counter = SimpleNamespace(update_producer=lambda: 3)
+    connector.load_queue = Queue()
+    connector.stats = {"load": 0}
+
+    assert connector.offload(
+        [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["page"],
+                device_indices=torch.tensor([0, 1]),
+            )
+        ]
+    )
+    assert connector.start_layer_wise_loading() == 3
+    connector.pending_loads = {"second": [object()]}
+    assert connector.start_layer_wise_loading() == 3
+
+    assert calls == ["Mooncake connector"]
+    assert connector.stats["load"] == 2
+
+
+def test_prefetch_loads_before_returning():
+    worker_threads = []
+
+    class _Storage:
+        def batch_get_v2(self, transfers):
+            worker_threads.append(threading.get_ident())
+            return {
+                transfer.name: [True] * len(transfer.keys) for transfer in transfers
+            }
+
+    pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        translate_indices=lambda indices: indices,
+    )
+    connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
+    connector.page_size = 2
+    connector.pool_group = DevicePoolGroup([pool], num_layers=3, page_size=2)
+    connector.storage = _Storage()
+    connector.load_strategy = "prefetch"
+    connector.gc_frozen = True
+    connector.pending_loads = {}
+    connector.stats = {"load": 0}
+    connector.load_queue = Queue()
+    connector.load_thread = threading.Thread(
+        target=connector.load_thread_func, daemon=True
+    )
+    connector.load_thread.start()
+
+    assert connector.load(
+        "rid",
+        [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=["a"],
+                device_indices=torch.tensor([0, 1]),
+            )
+        ],
+    )
+    assert worker_threads == [connector.load_thread.ident]
+    assert connector.pending_loads == {}
+    assert connector.stats["load"] == 1
+
+    connector.load_queue.put(None)
+    connector.load_thread.join(timeout=5)
+
+
+def test_offload_runs_on_background_thread(monkeypatch):
     started = threading.Event()
     release = threading.Event()
     caller_thread = threading.get_ident()
     worker_threads = []
+    event_calls = []
+
+    monkeypatch.setattr(mooncake_tree_connector, "freeze_gc", lambda _: None)
+
+    class _Event:
+        def record(self):
+            event_calls.append("record")
+
+        def synchronize(self):
+            event_calls.append("synchronize")
+
+    monkeypatch.setattr(mooncake_tree_connector.device_module, "Event", _Event)
 
     class _Storage:
         def batch_set_v2(self, transfers):
+            assert event_calls == ["record", "synchronize"]
             worker_threads.append(threading.get_ident())
             started.set()
             assert release.wait(timeout=5)
@@ -132,14 +249,17 @@ def test_offload_runs_on_background_thread():
             }
 
     pool = SimpleNamespace(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
         translate_indices=lambda indices: indices,
         get_hybrid_pool_buffer=lambda: [],
     )
     connector = MooncakeTreeConnector.__new__(MooncakeTreeConnector)
     connector.page_size = 2
-    connector.sources = {PoolName.KV: PoolName.KV}
-    connector.pools = {PoolName.KV: pool}
+    connector.pool_group = DevicePoolGroup([pool], num_layers=1, page_size=2)
+    connector.pools = connector.pool_group.entry_map
     connector.storage = _Storage()
+    connector.gc_frozen = False
     connector.stats = {"lookup": 0, "load": 0, "offload": 0}
     connector.offload_queue = Queue()
     connector.offload_results = Queue()
@@ -411,3 +531,25 @@ def test_overlapping_load_retargets_freed_slots_to_tree_values():
     assert swa.device_indices.tolist() == [1012, 1013]
     assert mamba.device_indices.tolist() == [30, 301]
     assert queued["second"] == [full, swa, mamba]
+
+
+def test_prefetch_load_is_not_requeued_after_insert():
+    mixin = UnifiedCacheConnectorMixin()
+
+    def fail(*args):
+        raise AssertionError("prefetch must not be loaded twice")
+
+    mixin.connector = SimpleNamespace(
+        load_strategy="prefetch",
+        cancel_queued_load=fail,
+        load=fail,
+    )
+    transfer = PoolTransfer(name=PoolName.KV, device_indices=torch.tensor([100, 101]))
+    loaded = SimpleNamespace(device_indices=torch.tensor([1, 2, 10, 11]))
+
+    returned = mixin._retarget_connector_load(
+        "rid", [transfer], loaded, device_hit_len=2
+    )
+
+    assert returned.tolist() == [10, 11]
+    assert transfer.device_indices.tolist() == [100, 101]

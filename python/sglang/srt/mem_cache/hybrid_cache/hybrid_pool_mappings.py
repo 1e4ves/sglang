@@ -1,9 +1,14 @@
 from collections.abc import Callable, Sequence
+from dataclasses import replace
 from typing import Any, NamedTuple
 
 import torch
 
-from sglang.srt.mem_cache.hicache_storage import PoolName
+from sglang.srt.mem_cache.hicache_storage import (
+    PoolHitPolicy,
+    PoolName,
+    PoolTransfer,
+)
 
 
 class DeepSeekV4PoolMappings(NamedTuple):
@@ -98,15 +103,27 @@ class DevicePoolEntry:
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 
+        self.buffer_meta = [
+            [
+                (
+                    buffer.data_ptr(),
+                    buffer.stride(0) * buffer.element_size(),
+                    buffer.nbytes // buffer.shape[0] * self._row_span,
+                )
+                for buffer in component
+            ]
+            for component in self.components
+        ]
+
         self._component_offsets = []
         offset = 0
-        for component in self.components:
+        for component in self.buffer_meta:
             if not packed:
                 offset = 0
             offsets = []
-            for buffer in component:
+            for _, _, size in component:
                 offsets.append(offset)
-                offset += buffer[0].nbytes * self._row_span
+                offset += size
             self._component_offsets.append(offsets)
 
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
@@ -147,9 +164,17 @@ class DevicePoolEntry:
 
     def get_page_buffer_meta(self, indices: torch.Tensor):
         rows = self._rows(indices)
-        ptrs = [buffer[row].data_ptr() for row in rows for buffer in self.kv_buffer]
+        ptrs = [
+            base_ptr + row * row_stride
+            for row in rows
+            for component in self.buffer_meta
+            for base_ptr, row_stride, _ in component
+        ]
         sizes = [
-            buffer[0].nbytes * self._row_span for _ in rows for buffer in self.kv_buffer
+            size
+            for _ in rows
+            for component in self.buffer_meta
+            for _, _, size in component
         ]
         return ptrs, sizes
 
@@ -162,17 +187,17 @@ class DevicePoolEntry:
             return None
 
         items = []
-        for component, offsets in zip(self.components, self._component_offsets):
-            buffer = component[buffer_index]
-            items.append(
-                (buffer, buffer[0].nbytes * self._row_span, offsets[buffer_index])
-            )
+        for component, offsets in zip(self.buffer_meta, self._component_offsets):
+            base_ptr, row_stride, size = component[buffer_index]
+            items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
-            row_ptrs = [buffer[row].data_ptr() for buffer, _, _ in items]
-            row_sizes = [size for _, size, _ in items]
-            row_offsets = [offset for _, _, offset in items]
+            row_ptrs = [
+                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
+            ]
+            row_sizes = [size for _, _, size, _ in items]
+            row_offsets = [offset for _, _, _, offset in items]
             if self.packed:
                 ptrs.append(row_ptrs)
                 sizes.append(row_sizes)
@@ -198,6 +223,53 @@ class DevicePoolGroup:
         self.num_layers = num_layers
         self.page_size = page_size
         self.kv_buffer = None
+
+    def resolve_transfers(
+        self, transfers: list[PoolTransfer], *, allow_partial: bool = False
+    ) -> list[PoolTransfer]:
+        """Map logical cache transfers to Mooncake's physical device pools.
+
+        Cache components emit logical KV/SWA/MAMBA transfers, while Mooncake
+        operates on every registered DevicePoolEntry. For example, DeepSeek V4
+        C4/C128 pools reuse the KV transfer's page keys and indices, and its
+        state pools reuse the SWA transfer. This method creates one transfer per
+        physical pool and translates the source indices into that pool's rows.
+
+        Lookup and load require every source pool. Offload passes
+        ``allow_partial=True`` because a cache node may contain only some pools.
+        """
+        by_name = {transfer.name: transfer for transfer in transfers}
+        kv = by_name.get(PoolName.KV)
+        if kv is None or not kv.keys:
+            return []
+        if not allow_partial and not set(self.sources.values()) <= set(by_name):
+            return []
+
+        resolved = []
+        for name, source_name in self.sources.items():
+            source = by_name.get(source_name)
+            if source is None:
+                continue
+            indices = source.device_indices
+            resolved.append(
+                replace(
+                    source,
+                    name=name,
+                    host_indices=(
+                        self.entry_map[name].translate_indices(indices)
+                        if indices is not None
+                        else None
+                    ),
+                    keys=list(kv.keys if source_name == PoolName.KV else source.keys),
+                    hit_policy=(
+                        PoolHitPolicy.ALL_PAGES
+                        if source_name == PoolName.KV
+                        else source.hit_policy
+                    ),
+                    indices_from_pool=None,
+                )
+            )
+        return resolved
 
 
 def _state_views(state_pools: Sequence[Any], global_layers: Sequence[int]):

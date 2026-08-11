@@ -326,6 +326,10 @@ class UnifiedCacheConnectorMixin:
     ) -> torch.Tensor:
         """Retarget a queued load to the slots retained by ``insert``."""
         canonical_full = loaded.device_indices[device_hit_len:]
+        # Prefetch already populated L1 before insertion. Only a queued
+        # layer-wise load must follow slots that insert retained from the tree.
+        if getattr(self.connector, "load_strategy", "layer_wise") != "layer_wise":
+            return canonical_full
         for transfer in transfers:
             if transfer.name == PoolName.KV:
                 transfer.device_indices = canonical_full
