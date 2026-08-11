@@ -544,7 +544,12 @@ class DeepseekV4AttnBackend(
             # buffer would inherit the caller's context, and a creation inside
             # an inference_mode forward would forbid the in-place updates the
             # graph-capture path performs outside inference mode.
-            num_reqs = self.req_to_token.shape[0]
+            # Full target-verify CUDA graphs may pad the captured batch beyond
+            # max_running_requests. Size persistent metadata for the graph batch.
+            num_reqs = max(
+                self.req_to_token.shape[0],
+                model_runner.server_args.cuda_graph_config.decode.max_bs or 0,
+            )
             self.extend_seq_lens_buffer = torch.full(
                 (num_reqs,),
                 self.speculative_num_draft_tokens,
