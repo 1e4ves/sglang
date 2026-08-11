@@ -70,6 +70,8 @@ class PoolName(str, Enum):
     DEEPSEEK_V4_C4_STATE = "deepseek_v4_c4_state"
     DEEPSEEK_V4_C4_INDEXER_STATE = "deepseek_v4_c4_indexer_state"
     DEEPSEEK_V4_C128_STATE = "deepseek_v4_c128_state"
+    DEEPSEEK_V4_SWA_CANARY_HEAD = "deepseek_v4_swa_canary_head"
+    DEEPSEEK_V4_SWA_CANARY_TAIL = "deepseek_v4_swa_canary_tail"
 
     # Draft KV pool
     DRAFT = "draft"

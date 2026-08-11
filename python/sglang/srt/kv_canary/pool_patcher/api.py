@@ -61,6 +61,7 @@ def attach_canary_buffers(
         read_bytes=read_bytes,
         kv_token_id_vs_position_offset=kv_token_id_vs_position_offset,
     )
+    pool.canary_buffer_groups = groups
     logger.info(
         "attach_canary_buffers: pool=%s attacher=%s read_bytes=%d n_groups=%d kinds=%s "
         "kv_token_id_vs_position_offset=%d",

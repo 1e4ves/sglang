@@ -1647,6 +1647,11 @@ class KVCache(abc.ABC):
         # default state for optional layer-wise transfer control
         self.layer_transfer_counter = None
 
+        # Populated by kv-canary when enabled. Keeping the groups on the
+        # physical pool lets cache transports discover the sidecar buffers
+        # without reaching through ModelRunner/CanaryManager ownership.
+        self.canary_buffer_groups: tuple[Any, ...] = ()
+
         # for disagg with nvlink
         self.enable_custom_mem_pool, self.custom_mem_pool, _ = (
             maybe_init_custom_mem_pool(device=self.device)

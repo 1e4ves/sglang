@@ -358,6 +358,88 @@ def _dsv4_compressed_region_buffers(kvcache: Any, ratio: int) -> tuple[list, int
     return pool.kv_buffer, pool.bytes_per_page_padded
 
 
+@dataclass(frozen=True, slots=True)
+class _DSV4CanaryPageBuffers:
+    head: list[Any]
+    tail: list[Any]
+    layer_mapping: dict[int, int]
+    item_bytes: int
+
+
+def _build_dsv4_canary_page_buffers(
+    *,
+    target_pool: Any,
+    draft_pools: tuple[Any, ...],
+    swa_page_size: int,
+) -> _DSV4CanaryPageBuffers:
+    """Page-pack DSV4 SWA canaries for HiCache sidecar transfers.
+
+    Canary metadata is one fixed-width row per physical SWA slot, whereas
+    DeepSeekV4PagedHostPool transfers one row per SWA page.  Reshaping is a
+    zero-copy view.  One target/draft canary group is mapped to the first
+    transfer layer owned by that pool; backup copies every buffer at once and
+    load restores each buffer when that representative layer is dispatched.
+    """
+
+    head: list[Any] = []
+    tail: list[Any] = []
+    layer_mapping: dict[int, int] = {}
+    item_bytes = 0
+    transfer_layer_start = 0
+
+    for pool in (target_pool, *draft_pools):
+        swa_pool = getattr(pool, "swa_kv_pool", None)
+        if swa_pool is None:
+            continue
+
+        groups = getattr(pool, "canary_buffer_groups", ())
+        swa_groups = [
+            group
+            for group in groups
+            if getattr(getattr(group, "kind", None), "name", None) == "SWA"
+        ]
+        if len(swa_groups) > 1:
+            raise ValueError(
+                "DeepSeek V4 HiCache expects at most one SWA canary group per pool"
+            )
+        if swa_groups:
+            group = swa_groups[0]
+            local_id = len(head)
+            layer_mapping[transfer_layer_start] = local_id
+
+            page_views = []
+            for label, buf in (("head", group.k_head), ("tail", group.k_tail)):
+                if buf.ndim != 2 or not buf.is_contiguous():
+                    raise ValueError(
+                        f"DeepSeek V4 SWA canary {label} must be contiguous 2-D, "
+                        f"got shape={tuple(buf.shape)}"
+                    )
+                if buf.shape[0] % swa_page_size != 0:
+                    raise ValueError(
+                        f"DeepSeek V4 SWA canary slots must be page-aligned, "
+                        f"got slots={buf.shape[0]}, page_size={swa_page_size}"
+                    )
+                page_bytes = int(buf.shape[1]) * buf.element_size() * swa_page_size
+                if item_bytes and page_bytes != item_bytes:
+                    raise ValueError(
+                        "DeepSeek V4 target/draft SWA canaries must share slot width"
+                    )
+                item_bytes = page_bytes
+                page_views.append(buf.reshape(-1, page_bytes))
+
+            head.append(page_views[0])
+            tail.append(page_views[1])
+
+        transfer_layer_start += len(swa_pool.kv_buffer)
+
+    return _DSV4CanaryPageBuffers(
+        head=head,
+        tail=tail,
+        layer_mapping=layer_mapping,
+        item_bytes=item_bytes,
+    )
+
+
 def build_deepseek_v4_hicache_stack(
     *,
     params: CacheInitParams,
@@ -473,6 +555,36 @@ def build_deepseek_v4_hicache_stack(
                 device_free_fn=swa_attn_allocator.free,
             )
         )
+
+        canary_pages = _build_dsv4_canary_page_buffers(
+            target_pool=kvcache,
+            draft_pools=params.mtp_draft_device_pools,
+            swa_page_size=kvcache.swa_page_size,
+        )
+        if canary_pages.head:
+            canary_transfer_layer_num = transfer_layer_num + len(mtp_swa_device_buffers)
+            for name, device_buffers in (
+                (PoolName.DEEPSEEK_V4_SWA_CANARY_HEAD, canary_pages.head),
+                (PoolName.DEEPSEEK_V4_SWA_CANARY_TAIL, canary_pages.tail),
+            ):
+                host_pool = DeepSeekV4PagedHostPool(
+                    pool_name=str(name),
+                    device_buffers=device_buffers,
+                    item_bytes=canary_pages.item_bytes,
+                    num_host_pages=swa_num_host_pages,
+                    slot_page_size=kvcache.swa_page_size,
+                    layout=server_args.hicache_mem_layout,
+                    allocator_type=_get_allocator_type(server_args),
+                )
+                entries.append(
+                    build_pool_entry(
+                        name=name,
+                        host_pool=host_pool,
+                        device_pool=None,
+                        layer_mapping=canary_pages.layer_mapping,
+                        transfer_layer_num=canary_transfer_layer_num,
+                    )
+                )
 
     if c4_layer_mapping:
         c4_device_buffers, c4_item_bytes = _dsv4_compressed_region_buffers(kvcache, 4)
@@ -1167,6 +1279,8 @@ class _DeepSeekV4Strategy(StackStrategy):
                 (PoolName.DEEPSEEK_V4_C4_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C4_INDEXER_STATE, PoolName.SWA),
                 (PoolName.DEEPSEEK_V4_C128_STATE, PoolName.SWA),
+                (PoolName.DEEPSEEK_V4_SWA_CANARY_HEAD, PoolName.SWA),
+                (PoolName.DEEPSEEK_V4_SWA_CANARY_TAIL, PoolName.SWA),
             )
             if name in host_pool_group.entry_map
         ]
