@@ -4,6 +4,7 @@ import unittest
 from types import SimpleNamespace
 
 from sglang.srt.configs.model_config import (
+    ModelConfig,
     get_hybrid_layer_ids,
     is_embedding_gemma,
 )
@@ -11,6 +12,25 @@ from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
+
+
+class TestDraftModelConfig(CustomTestCase):
+    def test_qwen35_nextn_layer_count_is_set_on_nested_text_config(self):
+        text_config = SimpleNamespace(model_type="qwen3_5_moe_text")
+        hf_config = SimpleNamespace(
+            architectures=["Qwen3_5MoeForConditionalGeneration"],
+            text_config=text_config,
+        )
+        model_config = ModelConfig.__new__(ModelConfig)
+        model_config.hf_config = hf_config
+        model_config.hf_text_config = text_config
+        model_config.is_draft_model = True
+
+        model_config._config_draft_model()
+
+        self.assertEqual(hf_config.architectures, ["Qwen3_5ForCausalLMMTP"])
+        self.assertEqual(text_config.num_nextn_predict_layers, 1)
+        self.assertEqual(hf_config.num_nextn_predict_layers, 1)
 
 
 class TestHybridLayerIds(CustomTestCase):
