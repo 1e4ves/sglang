@@ -53,3 +53,7 @@ class CacheInitParams:
     component_registry_override: Optional[dict[ComponentType, type[TreeComponent]]] = (
         None
     )
+
+    # Draft device pools selected by the #30393 packed draft plan for direct
+    # connector L3 I/O. HiCache/L2 does not consume this field.
+    packed_draft_device_pools: tuple[object, ...] = ()

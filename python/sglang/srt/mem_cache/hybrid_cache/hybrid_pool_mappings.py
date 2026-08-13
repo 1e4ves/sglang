@@ -221,6 +221,12 @@ class DevicePoolGroup:
             raise ValueError("DevicePoolGroup contains duplicate pool names.")
         self.sources = {entry.name: entry.indices_from_pool for entry in self.entries}
         self.num_layers = num_layers
+        transfer_layer_counts = [num_layers]
+        transfer_layer_counts.extend(
+            max(getattr(entry, "layer_mapping", {}), default=-1) + 1
+            for entry in self.entries
+        )
+        self.transfer_num_layers = max(transfer_layer_counts)
         self.page_size = page_size
         self.kv_buffer = None
 
@@ -287,8 +293,114 @@ def _state_views(state_pools: Sequence[Any], global_layers: Sequence[int]):
     return views
 
 
+def _append_packed_tail_layers(
+    target_buffers: Sequence[torch.Tensor],
+    target_layer_mapping: dict[int, int],
+    draft_buffer_groups: Sequence[Sequence[torch.Tensor]],
+    *,
+    transfer_layer_start: int,
+) -> tuple[list[torch.Tensor], dict[int, int]]:
+    """Append draft buffers as tail layers of one physical Mooncake object."""
+    buffers = list(target_buffers)
+    layer_mapping = dict(target_layer_mapping)
+    transfer_layer = transfer_layer_start
+    for draft_buffers in draft_buffer_groups:
+        for buffer in draft_buffers:
+            layer_mapping[transfer_layer] = len(buffers)
+            buffers.append(buffer)
+            transfer_layer += 1
+    return buffers, layer_mapping
+
+
+def _resolve_packed_dsa_buffers(
+    kvcache: Any,
+    draft_device_pools: Sequence[Any],
+    *,
+    page_size: int,
+) -> tuple[list[torch.Tensor], list[torch.Tensor], dict[int, int]]:
+    from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
+
+    num_layers = len(kvcache.kv_buffer)
+    draft_kv_groups = []
+    draft_indexer_groups = []
+    for draft_pool in draft_device_pools:
+        if not isinstance(draft_pool, DSATokenToKVPool):
+            raise TypeError(
+                "Packed DSA connector backup requires DSATokenToKVPool drafts, "
+                f"got {type(draft_pool).__name__}."
+            )
+        if draft_pool.page_size != page_size:
+            raise ValueError(
+                "Packed DSA draft page size must match the tree page size: "
+                f"{draft_pool.page_size} != {page_size}."
+            )
+        draft_kv = list(draft_pool.kv_buffer)
+        draft_indexer = list(draft_pool.index_k_with_scale_buffer)
+        if not draft_kv or len(draft_kv) != len(draft_indexer):
+            raise ValueError(
+                "Packed DSA drafts require one indexer buffer per KV layer, "
+                f"got kv={len(draft_kv)} indexer={len(draft_indexer)}."
+            )
+        draft_kv_groups.append(draft_kv)
+        draft_indexer_groups.append(draft_indexer)
+
+    identity = {layer: layer for layer in range(num_layers)}
+    kv_buffers, layer_mapping = _append_packed_tail_layers(
+        kvcache.kv_buffer,
+        identity,
+        draft_kv_groups,
+        transfer_layer_start=num_layers,
+    )
+    indexer_buffers, indexer_mapping = _append_packed_tail_layers(
+        kvcache.index_k_with_scale_buffer,
+        identity,
+        draft_indexer_groups,
+        transfer_layer_start=num_layers,
+    )
+    if layer_mapping != indexer_mapping:
+        raise AssertionError("Packed DSA KV/indexer tail mappings diverged.")
+    return kv_buffers, indexer_buffers, layer_mapping
+
+
+def _resolve_packed_swa_buffers(
+    target_swa_pool: Any,
+    target_layer_mapping: dict[int, int],
+    draft_device_pools: Sequence[Any],
+    *,
+    page_size: int,
+    transfer_layer_start: int,
+) -> tuple[list[torch.Tensor], dict[int, int]]:
+    draft_swa_groups = []
+    for draft_pool in draft_device_pools:
+        draft_swa_pool = getattr(draft_pool, "swa_kv_pool", None)
+        if draft_swa_pool is None:
+            raise TypeError(
+                "Packed SWA connector backup requires drafts with a separate "
+                f"swa_kv_pool, got {type(draft_pool).__name__}."
+            )
+        if draft_swa_pool.page_size != page_size:
+            raise ValueError(
+                "Packed draft SWA page size must match the tree page size: "
+                f"{draft_swa_pool.page_size} != {page_size}."
+            )
+        draft_buffers = list(draft_swa_pool.kv_buffer)
+        if not draft_buffers:
+            raise ValueError("Packed draft SWA pool has no layer buffers.")
+        draft_swa_groups.append(draft_buffers)
+
+    return _append_packed_tail_layers(
+        target_swa_pool.kv_buffer,
+        target_layer_mapping,
+        draft_swa_groups,
+        transfer_layer_start=transfer_layer_start,
+    )
+
+
 def resolve_hybrid_device_pool_group(
-    kvcache: Any, page_size: int, req_to_token_pool: Any
+    kvcache: Any,
+    page_size: int,
+    req_to_token_pool: Any,
+    packed_draft_device_pools: Sequence[Any] = (),
 ) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
         DeepSeekV4TokenToKVPool,
@@ -309,13 +421,24 @@ def resolve_hybrid_device_pool_group(
             )
 
         mappings = resolve_deepseek_v4_pool_mappings(kvcache)
+        swa_buffers = kvcache.swa_kv_pool.kv_buffer
+        swa_layer_mapping = mappings.swa
+        if packed_draft_device_pools:
+            swa_buffers, swa_layer_mapping = _resolve_packed_swa_buffers(
+                kvcache.swa_kv_pool,
+                mappings.swa,
+                packed_draft_device_pools,
+                page_size=page_size,
+                transfer_layer_start=mappings.num_layers,
+            )
+
         entries = [
             DevicePoolEntry(
                 name=PoolName.SWA,
                 indices_from_pool=PoolName.SWA,
                 device_pool=kvcache.swa_kv_pool,
-                components=[kvcache.swa_kv_pool.kv_buffer],
-                layer_mapping=mappings.swa,
+                components=[swa_buffers],
+                layer_mapping=swa_layer_mapping,
                 page_size=page_size,
                 rows_are_pages=True,
             )
@@ -376,6 +499,11 @@ def resolve_hybrid_device_pool_group(
         return DevicePoolGroup(entries, mappings.num_layers, page_size)
 
     if isinstance(kvcache, HybridLinearKVPool):
+        if packed_draft_device_pools:
+            raise NotImplementedError(
+                "Packed draft backup for the unified tree connector currently "
+                "supports only DSA and DeepSeek-V4 SWA pools."
+            )
         if getattr(req_to_token_pool, "mamba_ckpt_pool", None) is not None:
             raise ValueError(
                 "Direct Mooncake does not support int8 Mamba checkpoint storage."
@@ -424,14 +552,18 @@ def resolve_hybrid_device_pool_group(
         )
 
     num_layers = len(kvcache.kv_buffer)
-    identity = {layer: layer for layer in range(num_layers)}
+    kv_buffers, indexer_buffers, layer_mapping = _resolve_packed_dsa_buffers(
+        kvcache,
+        packed_draft_device_pools,
+        page_size=page_size,
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.kv_buffer],
-            layer_mapping=identity,
+            components=[kv_buffers],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -439,8 +571,8 @@ def resolve_hybrid_device_pool_group(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[kvcache.index_k_with_scale_buffer],
-            layer_mapping=identity,
+            components=[indexer_buffers],
+            layer_mapping=layer_mapping,
             page_size=page_size,
             rows_are_pages=True,
         ),

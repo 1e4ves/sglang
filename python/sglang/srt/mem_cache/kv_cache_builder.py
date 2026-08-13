@@ -48,6 +48,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
     from sglang.srt.server_args import ServerArgs
+    from sglang.srt.speculative.base_spec_worker import TreeConnectorDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -143,6 +144,7 @@ def build_kv_cache(
     tp_group: GroupCoordinator,
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
+    tree_connector_draft_plan: Optional[TreeConnectorDraftPlan] = None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -204,6 +206,21 @@ def build_kv_cache(
     if model_config.is_multimodal and uses_transformers_backend:
         effective_chunked_prefill_size = None
 
+    packed_draft_device_pools = ()
+    if (
+        server_args.enable_unified_tree_connector
+        and tree_connector_draft_plan is not None
+    ):
+        from sglang.srt.speculative.base_spec_worker import TreeConnectorDraftMode
+
+        if tree_connector_draft_plan.mode == TreeConnectorDraftMode.PACKED:
+            packed_draft_device_pools = tree_connector_draft_plan.device_pools
+        elif tree_connector_draft_plan.mode == TreeConnectorDraftMode.SIDECAR:
+            logger.warning(
+                "Unified tree connector draft backup currently supports only "
+                "packed MTP/DSpark pools; sidecar draft state is not backed up."
+            )
+
     params = CacheInitParams(
         disable=disable_radix_cache,
         req_to_token_pool=req_to_token_pool,
@@ -233,6 +250,7 @@ def build_kv_cache(
         pp_size=ps.pp_size,
         chunked_prefill_size=effective_chunked_prefill_size,
         sliding_window_size=sliding_window_size,
+        packed_draft_device_pools=packed_draft_device_pools,
     )
 
     tree_cache = create_tree_cache(

@@ -454,6 +454,11 @@ class Scheduler(
             tp_group=self.tp_group,
             pp_group=self.pp_group,
             enable_hierarchical_cache=self.enable_hierarchical_cache,
+            tree_connector_draft_plan=(
+                self.draft_worker.tree_connector_draft_plan
+                if self.draft_worker is not None
+                else None
+            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -834,6 +839,8 @@ class Scheduler(
                 req_to_token_pool=pool,
                 token_to_kv_pool_allocator=allocator,
             )
+            if self.server_args.enable_unified_tree_connector:
+                self.draft_worker.init_tree_connector_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""

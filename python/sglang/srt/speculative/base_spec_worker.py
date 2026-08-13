@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
+from enum import Enum
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:
@@ -10,6 +13,62 @@ if TYPE_CHECKING:
     )
     from sglang.srt.managers.tp_worker import TpModelWorker
     from sglang.srt.model_executor.model_runner import ModelRunner
+    from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+
+logger = logging.getLogger(__name__)
+
+
+class TreeConnectorDraftMode(str, Enum):
+    NONE = "none"
+    PACKED = "packed"
+    SIDECAR = "sidecar"
+
+
+@dataclass(frozen=True, slots=True)
+class TreeConnectorDraftPlan:
+    mode: TreeConnectorDraftMode = TreeConnectorDraftMode.NONE
+    device_pools: tuple[object, ...] = ()
+
+
+def _tree_connector_pool_layer_summary(pool: object) -> str:
+    fields = [f"type={type(pool).__name__}"]
+    layer_num = getattr(pool, "layer_num", None)
+    if layer_num is not None:
+        fields.append(f"layers={layer_num}")
+
+    kv_buffer = getattr(pool, "kv_buffer", None)
+    if kv_buffer is not None:
+        fields.append(f"kv_layers={len(kv_buffer)}")
+
+    indexer_buffer = getattr(pool, "index_k_with_scale_buffer", None)
+    if indexer_buffer is not None:
+        fields.append(f"indexer_layers={len(indexer_buffer)}")
+
+    swa_pool = getattr(pool, "swa_kv_pool", None)
+    swa_buffer = getattr(swa_pool, "kv_buffer", None)
+    if swa_buffer is not None:
+        fields.append(f"swa_layers={len(swa_buffer)}")
+
+    return "{" + ", ".join(fields) + "}"
+
+
+def _can_pack_tree_connector_draft(
+    spec_algorithm: SpeculativeAlgorithm,
+    draft_runners: tuple[ModelRunner, ...],
+) -> bool:
+    """Reuse the packed/sidecar split from HiCache PR #30393 for L3."""
+    is_nextn_mtp = (
+        spec_algorithm.is_eagle()
+        and not spec_algorithm.is_eagle3()
+        and all(runner.model_config.num_nextn_predict_layers for runner in draft_runners)
+    )
+    architectures = draft_runners[0].model_config.hf_config.architectures or ()
+    is_dspark_dsv4 = (
+        spec_algorithm.is_dspark()
+        and architectures
+        and architectures[0] == "DeepseekV4ForCausalLMDSpark"
+    )
+    return bool(is_nextn_mtp or is_dspark_dsv4)
 
 
 class EagleDraftWorkerBase(ABC):
@@ -43,6 +102,67 @@ class EagleDraftWorkerBase(ABC):
 
 
 class BaseSpecWorker(ABC):
+    _tree_connector_draft_plan = TreeConnectorDraftPlan()
+
+    @property
+    def tree_connector_draft_plan(self) -> TreeConnectorDraftPlan:
+        return self._tree_connector_draft_plan
+
+    def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        draft_worker = self.draft_worker
+        if (
+            draft_worker is None
+            or spec_algorithm.is_ngram()
+            or spec_algorithm.is_frozen_kv_mtp()
+        ):
+            return ()
+        if spec_algorithm.is_dflash_family():
+            return (draft_worker.model_runner,)
+        return tuple(draft_worker.draft_runners)
+
+    def _build_tree_connector_draft_plan(self) -> TreeConnectorDraftPlan:
+        spec_algorithm = self.target_worker.model_runner.spec_algorithm
+        if not self.server_args.enable_unified_tree_connector:
+            return TreeConnectorDraftPlan()
+
+        draft_runners = self._draft_model_runners()
+        if not draft_runners:
+            return TreeConnectorDraftPlan()
+
+        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
+        architectures = draft_runners[0].model_config.hf_config.architectures or ()
+        if "InklingForConditionalGenerationMTP" in architectures:
+            raise NotImplementedError(
+                "Unified tree connector does not support Inkling MTP draft state yet."
+            )
+
+        if _can_pack_tree_connector_draft(spec_algorithm, draft_runners):
+            return TreeConnectorDraftPlan(
+                mode=TreeConnectorDraftMode.PACKED,
+                device_pools=draft_pools,
+            )
+
+        return TreeConnectorDraftPlan(
+            mode=TreeConnectorDraftMode.SIDECAR,
+            device_pools=draft_pools[:1],
+        )
+
+    def init_tree_connector_draft_plan(self) -> None:
+        self._tree_connector_draft_plan = self._build_tree_connector_draft_plan()
+        plan = self._tree_connector_draft_plan
+        if plan.mode is not TreeConnectorDraftMode.NONE:
+            pool_summaries = ", ".join(
+                _tree_connector_pool_layer_summary(pool) for pool in plan.device_pools
+            )
+            logger.info(
+                "Unified tree connector draft plan: mode=%s, pool_count=%d, "
+                "pools=[%s]",
+                plan.mode.value,
+                len(plan.device_pools),
+                pool_summaries,
+            )
+
     @property
     def target_worker(self) -> TpModelWorker:
         return self._target_worker
