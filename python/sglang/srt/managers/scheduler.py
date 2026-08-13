@@ -532,11 +532,6 @@ class Scheduler(
                 if self.draft_worker is not None
                 else None
             ),
-            tree_connector_draft_plan=(
-                self.draft_worker.tree_connector_draft_plan
-                if self.draft_worker is not None
-                else None
-            ),
         )
         self.is_hybrid_swa = result.is_hybrid_swa
         self.is_hybrid_ssm = result.is_hybrid_ssm
@@ -959,8 +954,6 @@ class Scheduler(
                 token_to_kv_pool_allocator=allocator,
             )
             self.draft_worker.init_hicache_draft_plan()
-            if self.server_args.enable_unified_tree_connector:
-                self.draft_worker.init_tree_connector_draft_plan()
 
     def init_all_attention_backends(self):
         """Initialize attention backends for all workers."""

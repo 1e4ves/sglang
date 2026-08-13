@@ -47,10 +47,7 @@ if TYPE_CHECKING:
     from sglang.srt.distributed.parallel_state_wrapper import ParallelState
     from sglang.srt.managers.tp_worker import BaseTpWorker
     from sglang.srt.server_args import ServerArgs
-    from sglang.srt.speculative.base_spec_worker import (
-        HiCacheDraftPlan,
-        TreeConnectorDraftPlan,
-    )
+    from sglang.srt.speculative.base_spec_worker import HiCacheDraftPlan
     from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 
 
@@ -150,7 +147,6 @@ def build_kv_cache(
     pp_group: GroupCoordinator,
     enable_hierarchical_cache: bool,
     hicache_draft_plan: Optional[HiCacheDraftPlan] = None,
-    tree_connector_draft_plan: Optional[TreeConnectorDraftPlan] = None,
 ) -> KVCacheBuildResult:
     sliding_window_size: Optional[int] = None
     full_tokens_per_layer: Optional[int] = None
@@ -214,15 +210,12 @@ def build_kv_cache(
         effective_chunked_prefill_size = None
 
     packed_draft_device_pools = ()
-    if (
-        server_args.enable_unified_tree_connector
-        and tree_connector_draft_plan is not None
-    ):
-        from sglang.srt.speculative.base_spec_worker import TreeConnectorDraftMode
+    if server_args.enable_unified_tree_connector and hicache_draft_plan is not None:
+        from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
-        if tree_connector_draft_plan.mode == TreeConnectorDraftMode.PACKED:
-            packed_draft_device_pools = tree_connector_draft_plan.device_pools
-        elif tree_connector_draft_plan.mode == TreeConnectorDraftMode.SIDECAR:
+        if hicache_draft_plan.mode == HiCacheDraftMode.PACKED:
+            packed_draft_device_pools = hicache_draft_plan.device_pools
+        elif hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR:
             logger.warning(
                 "Unified tree connector draft backup currently supports only "
                 "packed MTP/DSpark pools; sidecar draft state is not backed up."

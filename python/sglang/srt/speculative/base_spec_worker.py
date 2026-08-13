@@ -32,12 +32,6 @@ class HiCacheDraftMode(str, Enum):
     SIDECAR = "sidecar"
 
 
-class TreeConnectorDraftMode(str, Enum):
-    NONE = "none"
-    PACKED = "packed"
-    SIDECAR = "sidecar"
-
-
 @dataclass(frozen=True, slots=True)
 class HiCacheDraftPlan:
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
@@ -63,13 +57,7 @@ def _can_pack_hicache_mtp(
     return is_nextn_mtp or is_dspark_dsv4
 
 
-@dataclass(frozen=True, slots=True)
-class TreeConnectorDraftPlan:
-    mode: TreeConnectorDraftMode = TreeConnectorDraftMode.NONE
-    device_pools: tuple[object, ...] = ()
-
-
-def _tree_connector_pool_layer_summary(pool: object) -> str:
+def _draft_pool_layer_summary(pool: object) -> str:
     fields = [f"type={type(pool).__name__}"]
     layer_num = getattr(pool, "layer_num", None)
     if layer_num is not None:
@@ -89,25 +77,6 @@ def _tree_connector_pool_layer_summary(pool: object) -> str:
         fields.append(f"swa_layers={len(swa_buffer)}")
 
     return "{" + ", ".join(fields) + "}"
-
-
-def _can_pack_tree_connector_draft(
-    spec_algorithm: SpeculativeAlgorithm,
-    draft_runners: tuple[ModelRunner, ...],
-) -> bool:
-    """Reuse the packed/sidecar split from HiCache PR #30393 for L3."""
-    is_nextn_mtp = (
-        spec_algorithm.is_eagle()
-        and not spec_algorithm.is_eagle3()
-        and all(runner.model_config.num_nextn_predict_layers for runner in draft_runners)
-    )
-    architectures = draft_runners[0].model_config.hf_config.architectures or ()
-    is_dspark_dsv4 = (
-        spec_algorithm.is_dspark()
-        and architectures
-        and architectures[0] == "DeepseekV4ForCausalLMDSpark"
-    )
-    return bool(is_nextn_mtp or is_dspark_dsv4)
 
 
 class EagleDraftWorkerBase(ABC):
@@ -202,7 +171,6 @@ class EagleDraftWorkerBase(ABC):
 
 class BaseSpecWorker(ABC):
     _hicache_draft_plan = HiCacheDraftPlan()
-    _tree_connector_draft_plan = TreeConnectorDraftPlan()
 
     def __init__(self) -> None:
         self._additional_graph_memory_usage: dict[str, float] = {}
@@ -211,10 +179,6 @@ class BaseSpecWorker(ABC):
     @property
     def hicache_draft_plan(self) -> HiCacheDraftPlan:
         return self._hicache_draft_plan
-
-    @property
-    def tree_connector_draft_plan(self) -> TreeConnectorDraftPlan:
-        return self._tree_connector_draft_plan
 
     def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
         spec_algorithm = self.target_worker.model_runner.spec_algorithm
@@ -233,48 +197,6 @@ class BaseSpecWorker(ABC):
     def primary_draft_kv_pool(self) -> Optional[object]:
         draft_runners = self._draft_model_runners()
         return draft_runners[0].token_to_kv_pool if draft_runners else None
-
-    def _build_tree_connector_draft_plan(self) -> TreeConnectorDraftPlan:
-        spec_algorithm = self.target_worker.model_runner.spec_algorithm
-        if not self.server_args.enable_unified_tree_connector:
-            return TreeConnectorDraftPlan()
-
-        draft_runners = self._draft_model_runners()
-        if not draft_runners:
-            return TreeConnectorDraftPlan()
-
-        draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        architectures = draft_runners[0].model_config.hf_config.architectures or ()
-        if "InklingForConditionalGenerationMTP" in architectures:
-            raise NotImplementedError(
-                "Unified tree connector does not support Inkling MTP draft state yet."
-            )
-
-        if _can_pack_tree_connector_draft(spec_algorithm, draft_runners):
-            return TreeConnectorDraftPlan(
-                mode=TreeConnectorDraftMode.PACKED,
-                device_pools=draft_pools,
-            )
-
-        return TreeConnectorDraftPlan(
-            mode=TreeConnectorDraftMode.SIDECAR,
-            device_pools=draft_pools[:1],
-        )
-
-    def init_tree_connector_draft_plan(self) -> None:
-        self._tree_connector_draft_plan = self._build_tree_connector_draft_plan()
-        plan = self._tree_connector_draft_plan
-        if plan.mode is not TreeConnectorDraftMode.NONE:
-            pool_summaries = ", ".join(
-                _tree_connector_pool_layer_summary(pool) for pool in plan.device_pools
-            )
-            logger.info(
-                "Unified tree connector draft plan: mode=%s, pool_count=%d, "
-                "pools=[%s]",
-                plan.mode.value,
-                len(plan.device_pools),
-                pool_summaries,
-            )
 
     @property
     def target_worker(self) -> TpModelWorker:
@@ -338,7 +260,10 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
-        if not self.server_args.enable_hierarchical_cache:
+        if not (
+            self.server_args.enable_hierarchical_cache
+            or self.server_args.enable_unified_tree_connector
+        ):
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()
@@ -350,11 +275,14 @@ class BaseSpecWorker(ABC):
             in draft_runners[0].model_config.hf_config.architectures
         ):
             raise NotImplementedError(
-                "HiCache does not support Inkling MTP draft state yet."
+                "Draft cache backup does not support Inkling MTP state yet."
             )
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
-            target_model_runner.mtp_draft_device_pools = draft_pools
+            # This field feeds only the HiCache/L2 pool assembler. The direct
+            # tree connector consumes the plan separately for L3 I/O.
+            if self.server_args.enable_hierarchical_cache:
+                target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
@@ -369,6 +297,20 @@ class BaseSpecWorker(ABC):
 
     def init_hicache_draft_plan(self) -> None:
         self._hicache_draft_plan = self._build_hicache_draft_plan()
+        plan = self._hicache_draft_plan
+        if plan.mode is not HiCacheDraftMode.NONE:
+            pool_summaries = ", ".join(
+                _draft_pool_layer_summary(pool) for pool in plan.device_pools
+            )
+            logger.info(
+                "Draft cache backup plan: mode=%s, hicache=%s, "
+                "tree_connector=%s, pool_count=%d, pools=[%s]",
+                plan.mode.value,
+                self.server_args.enable_hierarchical_cache,
+                self.server_args.enable_unified_tree_connector,
+                len(plan.device_pools),
+                pool_summaries,
+            )
 
     def alloc_memory_pool(
         self,
