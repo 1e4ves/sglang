@@ -55,8 +55,6 @@ def _can_pack_hicache_mtp(
         == "DeepseekV4ForCausalLMDSpark"
     )
     return is_nextn_mtp or is_dspark_dsv4
-
-
 def _draft_pool_layer_summary(pool: object) -> str:
     fields = [f"type={type(pool).__name__}"]
     layer_num = getattr(pool, "layer_num", None)
@@ -262,7 +260,7 @@ class BaseSpecWorker(ABC):
         spec_algorithm = target_model_runner.spec_algorithm
         if not (
             self.server_args.enable_hierarchical_cache
-            or self.server_args.enable_unified_tree_connector
+            or self.server_args.enable_unified_cache_external_linker
         ):
             return HiCacheDraftPlan()
 
@@ -280,7 +278,7 @@ class BaseSpecWorker(ABC):
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             # This field feeds only the HiCache/L2 pool assembler. The direct
-            # tree connector consumes the plan separately for L3 I/O.
+            # external linker consumes the plan separately for L3 I/O.
             if self.server_args.enable_hierarchical_cache:
                 target_model_runner.mtp_draft_device_pools = draft_pools
             return HiCacheDraftPlan(
@@ -304,10 +302,10 @@ class BaseSpecWorker(ABC):
             )
             logger.info(
                 "Draft cache backup plan: mode=%s, hicache=%s, "
-                "tree_connector=%s, pool_count=%d, pools=[%s]",
+                "external_linker=%s, pool_count=%d, pools=[%s]",
                 plan.mode.value,
                 self.server_args.enable_hierarchical_cache,
-                self.server_args.enable_unified_tree_connector,
+                self.server_args.enable_unified_cache_external_linker,
                 len(plan.device_pools),
                 pool_summaries,
             )

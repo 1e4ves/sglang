@@ -39,7 +39,6 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
     ComponentAction,
     FreeComponentDeviceSlot,
     FreeDeviceKV,
-    OffloadConnector,
     ReplaceWriteThroughOnNodeSplit,
 )
 
@@ -65,9 +64,8 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
-from sglang.srt.mem_cache.unified_cache_connector_mixin import (
-    UnifiedCacheConnectorMixin,
-    UnifiedTreeConnector,
+from sglang.srt.mem_cache.unified_cache_linker import (
+    UnifiedCacheLinkerWrapper,
 )
 from sglang.srt.observability.metrics_collector import (
     STAT_LOGGER_ROLE_STORAGE,
@@ -135,7 +133,7 @@ class _OngoingPrefetch(NamedTuple):
     comp_xfers: dict[ComponentType, list[PoolTransfer]]
 
 
-class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
+class UnifiedRadixCache(BasePrefixCache):
     def __init__(
         self,
         params: CacheInitParams,
@@ -226,7 +224,7 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         self.prefetch_timeout_base = 1.0
         self.prefetch_timeout_per_page = 0.25
         self.hicache_storage_pass_prefix_keys = False
-        self.connector: Optional[UnifiedTreeConnector] = None
+        self.linker: Optional[UnifiedCacheLinkerWrapper] = None
 
         self.reset()
         logger.info(
@@ -300,16 +298,21 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             )
             self.work_list.append(send_work)
 
+    def init_cache_linker(
+        self, server_args: ServerArgs, params: CacheInitParams
+    ) -> None:
+        """Attach an external KV store directly to the device pools (direct L3)."""
+        self.linker = UnifiedCacheLinkerWrapper(self, server_args, params)
+
     def reset(self) -> None:
+        if self.linker is not None:
+            self.linker.reset()
         self._reset_full()
 
     def _reset_full(self) -> None:
         """Full reset: destroy entire tree and all state."""
-        if self.connector is not None:
-            self.connector.reset()
         self.tree_core.reset()
         self.session_refs.reset()
-        self.reset_connector_state()
 
         # Reset Controller.
         self.session.slots.clear()
@@ -415,7 +418,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             self.register_sidecar_pool(spec)
 
     def release_host_resources(self) -> None:
-        self.close_connector()
+        if self.linker is not None:
+            self.linker.close()
         if self.host_pool_group is not None:
             self.host_pool_group.destroy()
 
@@ -433,11 +437,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             result = component.finalize_match_result_in_cache(params, result)
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
-        if self.connector is not None and params.req is not None:
-            key, _ = params.key.maybe_to_bigram_view(self.tree_core.is_eagle)
-            result = self.match_connector(
-                key.page_aligned(self.page_size), params.req, result
-            )
+        if self.linker is not None and params.req is not None:
+            result = self.linker.match(params.key, params.req, result)
         return result
 
     def insert(self, params: InsertParams) -> InsertResult:
@@ -898,9 +899,10 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             for indices in action.indices:
                 self.token_to_kv_pool_allocator.free_segment(indices, start_pos=0)
         elif isinstance(action, BackupKV):
-            self._execute_and_commit_kv_backup(action)
-        elif isinstance(action, OffloadConnector):
-            self.offload_connector_node(action.node_id)
+            if self.linker is not None:
+                self.linker.offload_nodes(action.node_ids)
+            else:
+                self._execute_and_commit_kv_backup(action)
         else:
             raise AssertionError(f"unhandled CacheAction: {type(action).__name__}")
 
@@ -1536,7 +1538,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         return self.prefetch_loaded_tokens_by_reqid.pop(req_id, 0)
 
     def release_aborted_request(self, rid: str) -> None:
-        self.release_connector_request(rid)
+        if self.linker is not None:
+            self.linker.release_request(rid)
         self.prefetch_loaded_tokens_by_reqid.pop(rid, None)
         if rid not in self.ongoing_prefetch:
             return
@@ -1587,7 +1590,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
     def _drain_storage_control_queues_impl(
         self,
-        n_revoke: Optional[int],
         n_storage_hit: Optional[int],
         n_backup: Optional[int],
         n_release: Optional[int],
@@ -1606,10 +1608,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 drained += 1
                 yield item
 
-        def _drain_revoke():
-            for req_id in _drain_queue(cc.prefetch_revoke_queue, n_revoke):
-                self._revoke_pending_prefetch(req_id)
-
         def _drain_and_alloc_storage_hit():
             for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
                 req_id = operation.request_id
@@ -1619,6 +1617,10 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                     continue
                 if operation.is_terminated():
                     # request was aborted while the storage query was in flight
+                    self._revoke_pending_prefetch(req_id)
+                    continue
+                if operation.storage_hit_count < self.prefetch_threshold:
+                    # not to prefetch if not enough benefits
                     self._revoke_pending_prefetch(req_id)
                     continue
 
@@ -1696,7 +1698,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_revoke()
         _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
@@ -1707,7 +1708,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         extra_release_queues = getattr(cc, "extra_host_mem_release_queues", {})
         extra_pool_names = list(extra_release_queues)
         local_qsize_list = [
-            cc.prefetch_revoke_queue.qsize(),
             cc.prefetch_hit_queue.qsize(),
             cc.ack_backup_queue.qsize(),
             cc.host_mem_release_queue.qsize(),
@@ -1722,13 +1722,12 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         )
         self._all_reduce_attn_groups(qsizes, torch.distributed.ReduceOp.MIN)
         qsize_list = list(map(int, qsizes.tolist()))
-        n_revoke, n_storage_hit, n_backup, n_release = qsize_list[:4]
+        n_storage_hit, n_backup, n_release = qsize_list[:3]
         extra_release_counts = {
             pool_name: count
-            for pool_name, count in zip(extra_pool_names, qsize_list[4:])
+            for pool_name, count in zip(extra_pool_names, qsize_list[3:])
         }
         self._drain_storage_control_queues_impl(
-            n_revoke=n_revoke,
             n_storage_hit=n_storage_hit,
             n_backup=n_backup,
             n_release=n_release,
@@ -1852,7 +1851,6 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             )
             storage_queue_sizes = (
                 (
-                    cc.prefetch_revoke_queue.qsize(),
                     cc.prefetch_hit_queue.qsize(),
                     cc.ack_backup_queue.qsize(),
                     cc.host_mem_release_queue.qsize(),
@@ -1862,22 +1860,30 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 else ()
             )
 
+        # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+        # equal iff reclaim victim order matched on every rank.
+        digest = self.tree_core.write_back_duplicate_reclaim_digest
         ready_counts = torch.tensor(
             [
                 write_acks,
                 load_acks,
                 *storage_queue_sizes,
+                digest,
+                -digest,
             ],
-            dtype=torch.int,
+            dtype=torch.int64,
             device="cpu",
         )
         self._all_reduce(ready_counts, torch.distributed.ReduceOp.MIN)
 
         count_values = list(map(int, ready_counts.tolist()))
+        assert (
+            count_values[-2] == -count_values[-1]
+        ), "write_back duplicate-reclaim victims diverged across TP ranks"
         return (
             count_values[0],
             count_values[1],
-            tuple(count_values[2:]),
+            tuple(count_values[2:-2]),
             extra_pool_names,
         )
 
@@ -1949,11 +1955,17 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             finish_count = 0
             if self.pp_rank == 0:
                 finish_count = self._count_ready_acks(cc.ack_load_queue)
-            finish_count_tensor = torch.tensor(
-                finish_count, dtype=torch.int, device="cpu"
+            # Piggybacked TP check: [digest, -digest] MIN-reduces to [min, -max],
+            # equal iff reclaim victim order matched on every rank.
+            digest = self.tree_core.write_back_duplicate_reclaim_digest
+            sync_tensor = torch.tensor(
+                [finish_count, digest, -digest], dtype=torch.int64, device="cpu"
             )
-            self._all_reduce(finish_count_tensor, torch.distributed.ReduceOp.MIN)
-            finish_count = finish_count_tensor.item()
+            self._all_reduce(sync_tensor, torch.distributed.ReduceOp.MIN)
+            finish_count = int(sync_tensor[0].item())
+            assert (
+                sync_tensor[1].item() == -sync_tensor[2].item()
+            ), "write_back duplicate-reclaim victims diverged across TP ranks"
 
         while finish_count > 0:
             ack = cc.ack_load_queue.pop(0)
@@ -1962,6 +1974,8 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
                 node, lock_params, host_lock_params = self.ongoing_load_back.pop(ack_id)
                 self.dec_lock_ref(node, lock_params)
                 self.dec_host_lock_ref(node, host_lock_params)
+                # Unpin the loaded nodes; host copies stay as reclaimable duplicates.
+                self.tree_core.finish_load_back(node)
 
             if self.metrics_collector is not None:
                 for pool, num_tokens in (ack.num_tokens_by_pool or {}).items():
@@ -1990,10 +2004,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
         mem_quota = params.mem_quota
         req = params.req
         assert req is not None
+        if self.linker is not None and self.linker.has_hit(req.rid):
+            return self.linker.load_back(req)
         last_best_match_device_node_id = req.last_node
-
-        if self.connector is not None and req.rid in self._connector_markers:
-            return self.load_connector(req)
 
         if (
             self.tree_core.is_full_device_evicted(best_match_node_id)
@@ -2027,9 +2040,11 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
 
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
+        if self.linker is not None:
+            self.linker.drain_offloads()
+            return
         # Reap the previous round's PP-sync sends before issuing new ones.
         self._drain_async_work()
-        self.drain_connector_offloads()
 
         if self.pp_size != 1:
             self.writing_check()
@@ -2047,16 +2062,15 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             self.loading_check(finish_count=load_finish_count)
 
             if self.enable_storage and storage_queue_sizes:
-                n_revoke, n_storage_hit, n_backup, n_release = storage_queue_sizes[:4]
+                n_storage_hit, n_backup, n_release = storage_queue_sizes[:3]
                 extra_release_counts = {
                     pool_name: count
                     for pool_name, count in zip(
                         extra_pool_names,
-                        storage_queue_sizes[4:],
+                        storage_queue_sizes[3:],
                     )
                 }
                 self._drain_storage_control_queues_impl(
-                    n_revoke=n_revoke,
                     n_storage_hit=n_storage_hit,
                     n_backup=n_backup,
                     n_release=n_release,
@@ -2069,9 +2083,9 @@ class UnifiedRadixCache(UnifiedCacheConnectorMixin, BasePrefixCache):
             )
 
     def ready_to_load_host_cache(self) -> int:
-        """Start queued cache loading for the next prefill batch."""
-        if self.connector is not None:
-            return self.connector.start_layer_wise_loading()
+        """Notify the cache controller to start the KV cache loading."""
+        if self.linker is not None:
+            return self.linker.start_layer_wise_loading()
         if self.cache_controller is not None:
             return self.cache_controller.start_loading()
         return 0

@@ -210,14 +210,17 @@ def build_kv_cache(
         effective_chunked_prefill_size = None
 
     packed_draft_device_pools = ()
-    if server_args.enable_unified_tree_connector and hicache_draft_plan is not None:
+    if (
+        server_args.enable_unified_cache_external_linker
+        and hicache_draft_plan is not None
+    ):
         from sglang.srt.speculative.base_spec_worker import HiCacheDraftMode
 
         if hicache_draft_plan.mode == HiCacheDraftMode.PACKED:
             packed_draft_device_pools = hicache_draft_plan.device_pools
         elif hicache_draft_plan.mode == HiCacheDraftMode.SIDECAR:
             logger.warning(
-                "Unified tree connector draft backup currently supports only "
+                "Unified cache external linker draft backup supports only "
                 "packed MTP/DSpark pools; sidecar draft state is not backed up."
             )
 

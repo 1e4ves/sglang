@@ -32,7 +32,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     BASE_COMPONENT_TYPE,
     CacheTransferPhase,
     ComponentType,
-    ConnectorTransferPhase,
+    LinkerTransferPhase,
     EvictLayer,
     LRURefreshPhase,
     PreparePrefetchResult,
@@ -879,17 +879,16 @@ class SWAComponent(TreeComponent):
 
         return None
 
-    def build_connector_transfer(
+    def build_external_linker_transfer(
         self,
-        phase: ConnectorTransferPhase,
-        *,
-        node: Optional[UnifiedTreeNode] = None,
-        keys: Optional[Sequence[str]] = None,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
         page = self.cache.page_size
         window_pages = (self.sliding_window_size + page - 1) // page
 
-        if phase == ConnectorTransferPhase.OFFLOAD:
+        if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
             value = node.component_data[self.component_type].value
@@ -916,7 +915,7 @@ class SWAComponent(TreeComponent):
             keys=tail_keys,
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
-        if phase == ConnectorTransferPhase.LOAD:
+        if phase == LinkerTransferPhase.LOAD:
             num_tokens = len(tail_keys) * page
             allocator = self.cache.token_to_kv_pool_allocator.swa_attn_allocator
             shortfall = max(0, num_tokens - allocator.available_size())
@@ -928,7 +927,7 @@ class SWAComponent(TreeComponent):
             transfer.device_indices = transfer.device_indices.to(torch.int64)
         return transfer
 
-    def finish_connector_load(
+    def finish_external_linker_load(
         self,
         req: Req,
         full_transfer: PoolTransfer,

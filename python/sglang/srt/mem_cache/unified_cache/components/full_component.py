@@ -22,8 +22,8 @@ from sglang.srt.mem_cache.unified_cache.cache_action import FreeComponentDeviceS
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
-    ConnectorTransferPhase,
     EvictLayer,
+    LinkerTransferPhase,
     TreeComponent,
 )
 
@@ -450,14 +450,13 @@ class FullComponent(TreeComponent):
         allocator = self.cache.token_to_kv_pool_allocator
         return getattr(allocator, "full_attn_allocator", allocator)
 
-    def build_connector_transfer(
+    def build_external_linker_transfer(
         self,
-        phase: ConnectorTransferPhase,
-        *,
-        node: Optional[UnifiedTreeNode] = None,
-        keys: Optional[Sequence[str]] = None,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        if phase == ConnectorTransferPhase.OFFLOAD:
+        if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
             value = node.component_data[self.component_type].value
@@ -471,7 +470,7 @@ class FullComponent(TreeComponent):
 
         if not keys:
             return None
-        if phase == ConnectorTransferPhase.LOOKUP:
+        if phase == LinkerTransferPhase.LOOKUP:
             return PoolTransfer(name=PoolName.KV, keys=list(keys))
 
         # LOAD: every tail page gets fresh device slots (plain alloc; load-back
@@ -490,7 +489,7 @@ class FullComponent(TreeComponent):
             keys=list(keys),
         )
 
-    def finish_connector_load(
+    def finish_external_linker_load(
         self,
         req: Req,
         full_transfer: PoolTransfer,

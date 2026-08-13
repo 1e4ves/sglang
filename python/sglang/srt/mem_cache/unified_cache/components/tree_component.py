@@ -89,7 +89,7 @@ class CacheTransferPhase(str, Enum):
     PREFETCH = "prefetch"  # Storage→H
 
 
-class ConnectorTransferPhase(str, Enum):
+class LinkerTransferPhase(str, Enum):
     LOOKUP = "lookup"
     LOAD = "load"
     OFFLOAD = "offload"
@@ -670,31 +670,6 @@ class TreeComponent(ABC):
         Returns None if the component has nothing to transfer."""
         return None
 
-    def build_connector_transfer(
-        self,
-        phase: ConnectorTransferPhase,
-        *,
-        node: Optional[UnifiedTreeNode] = None,
-        keys: Optional[Sequence[str]] = None,
-    ) -> Optional[PoolTransfer]:
-        """Build this component's direct device/storage transfer.
-
-        For LOOKUP / LOAD, ``keys`` are the per-page hashes of the
-        device-uncached tail (page 0 is the first uncached page).
-        """
-        return None
-
-    def finish_connector_load(
-        self,
-        req: Req,
-        full_transfer: PoolTransfer,
-        transfer: PoolTransfer,
-        prefix_len: int,
-        success: bool,
-    ) -> None:
-        """Commit a loaded sidecar, or release it after a failed load."""
-        pass
-
     def commit_hicache_transfer(
         self,
         node: UnifiedTreeNode,
@@ -726,3 +701,31 @@ class TreeComponent(ABC):
         raise NotImplementedError(
             f"{self.component_type} cannot apply {type(action).__name__}"
         )
+
+    # ---- External Cache Linker Hooks ----
+
+    def build_external_linker_transfer(
+        self,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
+    ) -> Optional[PoolTransfer]:
+        """Build this component's direct device/storage transfer.
+
+        ``node`` carries the device pages to persist on OFFLOAD and is None
+        otherwise. ``keys`` are the per-page hashes of the device-uncached tail
+        (page 0 is the first uncached page) on LOOKUP / LOAD, and None on
+        OFFLOAD, where the keys come from ``node.hash_value``.
+        """
+        return None
+
+    def finish_external_linker_load(
+        self,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        success: bool,
+    ) -> None:
+        """Commit a loaded sidecar, or release it after a failed load."""
+        pass

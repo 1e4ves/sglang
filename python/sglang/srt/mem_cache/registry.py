@@ -103,7 +103,7 @@ def default_radix_cache_factory(ctx: TreeCacheBuildContext) -> BasePrefixCache:
 
     if (
         envs.SGLANG_ENABLE_UNIFIED_RADIX_TREE.get()
-        or server_args.enable_unified_tree_connector
+        or server_args.enable_unified_cache_external_linker
         or use_mlx()
     ):
         return _create_unified_radix_cache(ctx, server_args, params)
@@ -194,9 +194,9 @@ def _create_unified_radix_cache(
         ctx.tp_worker.register_hicache_layer_transfer_counter(
             cache.cache_controller.layer_done_counter
         )
-    elif server_args.enable_unified_tree_connector:
-        cache.init_connector(server_args, params)
-        counter = cache.connector.layer_done_counter
+    elif server_args.enable_unified_cache_external_linker:
+        cache.init_cache_linker(server_args, params)
+        counter = cache.linker.layer_done_counter
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         kvcache.register_layer_transfer_counter(counter)
         ctx.tp_worker.register_hicache_layer_transfer_counter(counter)

@@ -124,7 +124,7 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     device: torch.device
     enable_hicache: bool
     enable_storage: bool
-    enable_connector: bool
+    enable_external_cache_linker: bool
     write_through_threshold: int
     is_write_back: bool
     has_swa_host_pool: bool
@@ -460,6 +460,15 @@ class UnifiedTreeCoreInterface(KVCacheEventMixin, ABC):
     ) -> list[CacheAction | ComponentAction]:
         """Commit a successful H->D load-back onto the node; returns any cache actions."""
         ...
+
+    @abstractmethod
+    def finish_load_back(self, anchor_node_id: NodeId) -> None:
+        """Clear the in-flight H->D marks on the anchor's root path at ack time."""
+        ...
+
+    # Order-sensitive digest of write_back duplicate-reclaim victim ids,
+    # cross-checked across TP ranks; cores that never reclaim keep 0.
+    write_back_duplicate_reclaim_digest: int = 0
 
     @abstractmethod
     def mark_write_through_pending(self, node_id: NodeId) -> None:

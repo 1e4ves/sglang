@@ -28,7 +28,7 @@ from sglang.srt.mem_cache.unified_cache.cache_action import (
 from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
-    ConnectorTransferPhase,
+    LinkerTransferPhase,
     EvictLayer,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -36,7 +36,10 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     TreeComponent,
     get_and_increase_time_counter,
 )
-from sglang.srt.runtime_context import get_exec, get_server_args
+from sglang.srt.runtime_context import (
+    get_exec,
+    mamba_cache_chunk_size,
+)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -66,7 +69,7 @@ class MambaComponent(TreeComponent):
                 params.page_size == 1
             ), f"MambaComponent requires page_size=1 when mamba_extra_buffer is disabled, got {params.page_size}"
         super().__init__(cache, params)
-        self.mamba_cache_chunk_size = get_server_args().mamba_cache_chunk_size
+        self.mamba_cache_chunk_size = mamba_cache_chunk_size()
         self.mamba_max_states_per_path = get_exec().mamba.mamba_max_states_per_path
         # HiCache state
         self._mamba_pool_host = None  # set to host mamba pool when HiCache enabled
@@ -630,14 +633,13 @@ class MambaComponent(TreeComponent):
                 self._free_mamba_value(insert_params.mamba_value)
             req.mamba_last_track_seqlen = None
 
-    def build_connector_transfer(
+    def build_external_linker_transfer(
         self,
-        phase: ConnectorTransferPhase,
-        *,
-        node: Optional[UnifiedTreeNode] = None,
-        keys: Optional[Sequence[str]] = None,
+        phase: LinkerTransferPhase,
+        node: Optional[UnifiedTreeNode],
+        keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        if phase == ConnectorTransferPhase.OFFLOAD:
+        if phase == LinkerTransferPhase.OFFLOAD:
             if node is None or not node.hash_value:
                 return None
             value = node.component_data[self.component_type].value
@@ -650,7 +652,7 @@ class MambaComponent(TreeComponent):
                 return None
             transfer_keys = [keys[-1]]
             slots = None
-            if phase == ConnectorTransferPhase.LOAD:
+            if phase == LinkerTransferPhase.LOAD:
                 # One radix slot plus one mutable request slot avoids a CoW race.
                 slots = torch.cat([self._alloc_mamba_slot(), self._alloc_mamba_slot()])
                 transfer_keys *= 2
@@ -661,7 +663,7 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
 
-    def finish_connector_load(
+    def finish_external_linker_load(
         self,
         req: Req,
         full_transfer: PoolTransfer,
