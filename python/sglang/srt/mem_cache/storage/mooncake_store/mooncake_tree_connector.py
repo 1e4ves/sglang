@@ -26,6 +26,23 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
+def _format_layer_ranges(layer_ids) -> str:
+    ids = sorted(layer_ids)
+    if not ids:
+        return "none"
+
+    ranges = []
+    start = previous = ids[0]
+    for layer_id in ids[1:]:
+        if layer_id == previous + 1:
+            previous = layer_id
+            continue
+        ranges.append(str(start) if start == previous else f"{start}-{previous}")
+        start = previous = layer_id
+    ranges.append(str(start) if start == previous else f"{start}-{previous}")
+    return ",".join(ranges)
+
+
 class LayerWiseLoadCounter:
     """CPU completion counter compatible with KV pools' layer wait hook."""
 
@@ -81,10 +98,49 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
         self.page_size = params.page_size
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
         self.pool_group = resolve_hybrid_device_pool_group(
-            kvcache, self.page_size, params.req_to_token_pool
+            kvcache,
+            self.page_size,
+            params.req_to_token_pool,
+            params.packed_draft_device_pools,
         )
         self.pools = self.pool_group.entry_map
         self.num_layers = self.pool_group.num_layers
+        if params.packed_draft_device_pools:
+            transfer_layers = self.pool_group.transfer_num_layers
+            logger.info(
+                "Unified tree Mooncake PACKED draft layout: target_layers=%d, "
+                "draft_tail_layers=%d, transfer_layers=%d, draft_pool_count=%d",
+                self.num_layers,
+                transfer_layers - self.num_layers,
+                transfer_layers,
+                len(params.packed_draft_device_pools),
+            )
+            for pool_name, pool in self.pools.items():
+                target_layer_ids = [
+                    layer_id
+                    for layer_id in pool.layer_mapping
+                    if layer_id < self.num_layers
+                ]
+                draft_layer_ids = [
+                    layer_id
+                    for layer_id in pool.layer_mapping
+                    if layer_id >= self.num_layers
+                ]
+                if not draft_layer_ids:
+                    continue
+                draft_buffer_indices = [
+                    pool.layer_mapping[layer_id] for layer_id in sorted(draft_layer_ids)
+                ]
+                logger.info(
+                    "Unified tree Mooncake PACKED layers: pool=%s, "
+                    "target_layers=%s, draft_layers=%s, "
+                    "draft_buffer_indices=%s, total_buffers=%d",
+                    pool_name.value,
+                    _format_layer_ranges(target_layer_ids),
+                    _format_layer_ranges(draft_layer_ids),
+                    draft_buffer_indices,
+                    len(pool.kv_buffer),
+                )
 
         tp_rank = 0
         if torch.distributed.is_available() and torch.distributed.is_initialized():
@@ -271,7 +327,7 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                 self.storage.store.batch_get_session_start(keys)
                 started.append(keys)
 
-            for layer in range(self.num_layers):
+            def load_layer_ranges(layer: int) -> None:
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
                         locations, layer
@@ -296,6 +352,22 @@ class MooncakeTreeConnector(UnifiedTreeConnector):
                             f"layer={layer}: transferred={result}, "
                             f"expected={expected}"
                         )
+
+            next_tail_layer = self.num_layers
+            for layer in range(self.num_layers):
+                load_layer_ranges(layer)
+                if next_tail_layer < self.pool_group.transfer_num_layers:
+                    # Match #30393's packed path: overlap one draft tail layer
+                    # with each target layer before completing that target layer.
+                    load_layer_ranges(next_tail_layer)
+                    next_tail_layer += 1
+                if layer == self.num_layers - 1:
+                    # Drain any remaining tails before publishing the final
+                    # target-layer completion. Speculative decoding can then
+                    # never observe stale draft state after an L3 replay.
+                    while next_tail_layer < self.pool_group.transfer_num_layers:
+                        load_layer_ranges(next_tail_layer)
+                        next_tail_layer += 1
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
