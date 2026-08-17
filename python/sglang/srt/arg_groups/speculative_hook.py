@@ -129,6 +129,31 @@ def handle_speculative_decoding(server_args: ServerArgs) -> None:
         if isinstance(algo, CustomSpecAlgo) and algo.validate_server_args is not None:
             algo.validate_server_args(server_args)
 
+    if (
+        algo is not None
+        and algo.is_speculative()
+        and server_args.disaggregation_mode == "decode"
+        and server_args.disaggregation_decode_enable_radix_cache
+    ):
+        # GLM-5.2's integrated MTP resolves NEXTN/EAGLE to EAGLE. Its draft KV
+        # pool shares target slot indices, so the existing PD page list already
+        # applies decode_prefix_len to both target and draft buffers.
+        if server_args.speculative_algorithm != "EAGLE":
+            raise ValueError(
+                "--disaggregation-decode-enable-radix-cache currently supports "
+                "only EAGLE/NEXTN speculative decoding, got "
+                f"--speculative-algorithm {server_args.speculative_algorithm}"
+            )
+        if server_args.enable_hierarchical_cache:
+            raise ValueError(
+                "--disaggregation-decode-enable-radix-cache with EAGLE/MTP "
+                "does not yet support --enable-hierarchical-cache"
+            )
+        logger.warning(
+            "EXPERIMENTAL: Decode radix cache with EAGLE/MTP requires Prefill "
+            "and Decode to use identical speculative arguments."
+        )
+
     if server_args.speculative_skip_dp_mlp_sync:
         assert server_args.speculative_algorithm == "EAGLE", (
             "--speculative-skip-dp-mlp-sync is only supported with "
