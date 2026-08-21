@@ -163,7 +163,7 @@ class SchedulerPPMixin:
                             "send_proxy_dict_to_next_stage"
                         ):
                             self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                                result.pp_hidden_states_proxy_tensors.to_wire_dict(),
+                                result.pp_hidden_states_proxy_tensors.tensors,
                                 async_send=True,
                                 msg_type="proxy",
                             )
@@ -345,7 +345,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.to_wire_dict(),
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -534,7 +534,7 @@ class SchedulerPPMixin:
                             self.launch_event
                         )
                         self.send_proxy_work = self._pp_send_dict_to_next_stage(
-                            result.pp_hidden_states_proxy_tensors.to_wire_dict(),
+                            result.pp_hidden_states_proxy_tensors.tensors,
                             async_send=True,
                             msg_type="proxy",
                         )
@@ -1193,7 +1193,7 @@ class SchedulerPPMixin:
                     self.device_module.current_stream().wait_event(q_event)
                     with torch.profiler.record_function("send_res_dict_to_next_stage"):
                         send_output_work = self._pp_send_dict_to_next_stage(
-                            pp_outputs_to_send.to_wire_dict(),
+                            pp_outputs_to_send.tensors,
                             async_send=True,
                             msg_type="output",
                         )
@@ -1202,7 +1202,7 @@ class SchedulerPPMixin:
             if pp_outputs:
                 with torch.profiler.record_function("send_res_dict_to_next_stage"):
                     send_output_work = self._pp_send_dict_to_next_stage(
-                        pp_outputs.to_wire_dict(),
+                        pp_outputs.tensors,
                         async_send=True,
                         msg_type="output",
                     )

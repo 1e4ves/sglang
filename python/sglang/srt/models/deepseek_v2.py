@@ -152,9 +152,6 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
-from sglang.srt.model_executor.pp_allreduce_fusion import (
-    PPAllReduceFusionSupport,
-)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2753,12 +2750,9 @@ class DeepseekV2Model(nn.Module):
         backend = getattr(backend, "primary", backend)
         return not getattr(backend, "use_mha", False)
 
-    def get_pp_allreduce_fusion_for_capture(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
+    def _pp_input_needs_allreduce_fusion(self, forward_batch: ForwardBatch) -> bool:
         if (
-            self.pp_group.is_first_rank
-            or forward_batch.can_run_tbo
+            forward_batch.can_run_tbo
             or self.dsa_enable_prefill_cp
             or self.mla_enable_prefill_cp
         ):
@@ -2797,6 +2791,9 @@ class DeepseekV2Model(nn.Module):
             assert pp_proxy_tensors is not None
             hidden_states = pp_proxy_tensors["hidden_states"]
             residual = pp_proxy_tensors["residual"]
+            hidden_states._sglang_needs_allreduce_fusion = (
+                self._pp_input_needs_allreduce_fusion(forward_batch)
+            )
             initial_topk_indices = pp_proxy_tensors.tensors.get("topk_indices")
         index_topk_share = IndexTopKShareState(forward_batch, initial_topk_indices)
         if not self.pp_group.is_first_rank:
@@ -2935,10 +2932,7 @@ class DeepseekV2Model(nn.Module):
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors["topk_indices"] = topk_indices
-            return PPProxyTensors(
-                proxy_tensors,
-                needs_allreduce_fusion=hidden_states._sglang_needs_allreduce_fusion,
-            )
+            return PPProxyTensors(proxy_tensors)
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
@@ -2959,9 +2953,7 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states.finalize()
 
 
-class DeepseekV2ForCausalLM(
-    nn.Module, DeepseekV2WeightLoaderMixin, PPAllReduceFusionSupport
-):
+class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3108,11 +3100,6 @@ class DeepseekV2ForCausalLM(
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
-
-    def get_pp_allreduce_fusion_for_capture(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
-        return self.model.get_pp_allreduce_fusion_for_capture(forward_batch)
 
     @torch.no_grad()
     def forward(

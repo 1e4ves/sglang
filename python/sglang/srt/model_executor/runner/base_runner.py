@@ -41,9 +41,6 @@ from sglang.srt.model_executor.forward_batch_info import (
     get_server_return_hidden_states_mode,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
-from sglang.srt.model_executor.pp_allreduce_fusion import (
-    PPAllReduceFusionSupport,
-)
 from sglang.srt.model_executor.runner.flashinfer_autotune import (
     maybe_flashinfer_autotune_extend,
     run_flashinfer_autotune_forward,
@@ -228,17 +225,6 @@ class BaseRunner(ABC):
         self.attn_tp_size = get_parallel().attn_tp_size
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
-
-    def _pp_input_needs_allreduce_fusion(
-        self, forward_batch: ForwardBatch
-    ) -> bool:
-        if self.pp_size <= 1 or self.model_runner.pp_group.is_first_rank:
-            return False
-
-        model = self.model_runner.model
-        if not isinstance(model, PPAllReduceFusionSupport):
-            return False
-        return bool(model.get_pp_allreduce_fusion_for_capture(forward_batch))
 
     def warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
@@ -637,10 +623,6 @@ class BaseRunner(ABC):
 
         forward_batch = mr.prepare_dummy_forward_batch(forward_batch)
         mr.attn_backend.init_forward_metadata(forward_batch)
-        if pp_proxy_tensors is not None:
-            pp_proxy_tensors.needs_allreduce_fusion = (
-                self._pp_input_needs_allreduce_fusion(forward_batch)
-            )
 
         def run_once():
             # Reused dummy batches may carry DP-local lazy caches from a prior
@@ -660,7 +642,9 @@ class BaseRunner(ABC):
                 mr.server_args.pp_size > 1
                 and "pp_proxy_tensors" in inspect.signature(mr.model.forward).parameters
             ):
-                kwargs["pp_proxy_tensors"] = pp_proxy_tensors.clone()
+                kwargs["pp_proxy_tensors"] = PPProxyTensors(
+                    {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
+                )
             if not mr.is_generation:
                 kwargs["get_embedding"] = True
 
