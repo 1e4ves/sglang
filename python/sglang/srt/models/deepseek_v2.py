@@ -75,6 +75,7 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
+    apply_flashinfer_allreduce_fusion,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -87,6 +88,7 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
+from sglang.srt.layers.dp_attention import is_enable_moe_cp_allgather
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -152,6 +154,9 @@ from sglang.srt.model_executor.cuda_graph_config import (
 )
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, PPProxyTensors
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.pp_allreduce_fusion import (
+    PPAllReduceFusionSupport,
+)
 from sglang.srt.model_executor.runner import get_is_capture_mode
 from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context import (
     is_in_breakable_cuda_graph,
@@ -2523,16 +2528,16 @@ class DeepseekV2DecoderLayer(nn.Module):
                     gemm_output_zero_allocator,
                 )
 
-        if (
+        needs_allreduce_fusion = (
             not (self.dsa_enable_prefill_cp or self.mla_enable_prefill_cp)
             and fuse_mlp_allreduce
-        ):
-            hidden_states._sglang_needs_allreduce_fusion = True
+        )
 
         if not fuse_mlp_allreduce:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
+        hidden_states._sglang_needs_allreduce_fusion = needs_allreduce_fusion
 
         return hidden_states, residual, topk_indices
 
@@ -2575,6 +2580,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             state.pop("residual_after_comm_pre_mlp"),
             state.forward_batch,
         )
+        hidden_states._sglang_needs_allreduce_fusion = False
 
         output = dict(
             positions=state.positions,
@@ -2746,6 +2752,26 @@ class DeepseekV2Model(nn.Module):
         backend = getattr(backend, "primary", backend)
         return not getattr(backend, "use_mha", False)
 
+    def get_pp_allreduce_fusion(
+        self, num_tokens: int, can_run_tbo: bool
+    ) -> bool:
+        """Return whether a PP boundary defers its all-reduce to the next stage."""
+        if (
+            can_run_tbo
+            or self.dsa_enable_prefill_cp
+            or self.mla_enable_prefill_cp
+            or is_enable_moe_cp_allgather()
+            or not get_moe_a2a_backend().is_none()
+            or get_attn_tp_context().input_scattered
+        ):
+            return False
+
+        parallel = get_parallel()
+        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
+            return False
+
+        return parallel.tp_size > 1 and apply_flashinfer_allreduce_fusion(num_tokens)
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -2905,7 +2931,10 @@ class DeepseekV2Model(nn.Module):
                         (0, get_dsa_index_topk(self.config)), dtype=torch.int32
                     )
                 proxy_tensors["topk_indices"] = topk_indices
-            return PPProxyTensors(proxy_tensors)
+            return PPProxyTensors(
+                proxy_tensors,
+                needs_allreduce_fusion=hidden_states._sglang_needs_allreduce_fusion,
+            )
         else:
             if not forward_batch.forward_mode.is_idle():
                 if residual is None:
@@ -2926,7 +2955,9 @@ class DeepseekV2Model(nn.Module):
         return hidden_states, aux_hidden_states.finalize()
 
 
-class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
+class DeepseekV2ForCausalLM(
+    nn.Module, DeepseekV2WeightLoaderMixin, PPAllReduceFusionSupport
+):
     # for quark model load
     packed_modules_mapping = {}
 
@@ -3073,6 +3104,11 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
 
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
+
+    def get_pp_allreduce_fusion(
+        self, num_tokens: int, can_run_tbo: bool
+    ) -> bool:
+        return self.model.get_pp_allreduce_fusion(num_tokens, can_run_tbo)
 
     @torch.no_grad()
     def forward(

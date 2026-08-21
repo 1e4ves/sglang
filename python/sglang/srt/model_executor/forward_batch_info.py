@@ -1664,22 +1664,51 @@ def build_inner_fb_view(
     )
 
 
+_PP_PENDING_ALLREDUCE_FUSION_KEY = "__sglang_needs_allreduce_fusion__"
+
+
 class PPProxyTensors:
     # adapted from https://github.com/vllm-project/vllm/blob/d14e98d924724b284dc5eaf8070d935e214e50c0/vllm/sequence.py#L1103
     tensors: Dict[str, torch.Tensor]
 
-    def __init__(self, tensors):
+    def __init__(self, tensors, needs_allreduce_fusion: bool = False):
         # manually define this function, so that
         # Dynamo knows `IntermediateTensors()` comes from this file.
         # Otherwise, dataclass will generate this function by evaluating
         # a string, and we will lose the information about the source file.
+        tensors = dict(tensors)
+        # Keep transport-only metadata out of the tensor payload. The
+        # scheduler normally consumes this field before construction, but a
+        # directly reconstructed wire dict should be safe to clone and slice.
+        tensors.pop("__msg_type__", None)
+        needs_allreduce_fusion = tensors.pop(
+            _PP_PENDING_ALLREDUCE_FUSION_KEY, needs_allreduce_fusion
+        )
         self.tensors = tensors
+        self.needs_allreduce_fusion = bool(needs_allreduce_fusion)
 
     def __getitem__(self, key: Union[str, slice]):
         if isinstance(key, str):
-            return self.tensors[key]
+            value = self.tensors[key]
+            if key == "hidden_states":
+                value._sglang_needs_allreduce_fusion = self.needs_allreduce_fusion
+            return value
         elif isinstance(key, slice):
-            return self.__class__({k: v[key] for k, v in self.tensors.items()})
+            return self.__class__(
+                {k: v[key] for k, v in self.tensors.items()},
+                needs_allreduce_fusion=self.needs_allreduce_fusion,
+            )
+
+    def clone(self):
+        return self.__class__(
+            {k: v.clone() for k, v in self.tensors.items()},
+            needs_allreduce_fusion=self.needs_allreduce_fusion,
+        )
+
+    def to_wire_dict(self) -> Dict[str, Union[torch.Tensor, bool]]:
+        tensors = dict(self.tensors)
+        tensors[_PP_PENDING_ALLREDUCE_FUSION_KEY] = self.needs_allreduce_fusion
+        return tensors
 
     def __setitem__(self, key: str, value: torch.Tensor):
         self.tensors[key] = value
@@ -1691,7 +1720,10 @@ class PPProxyTensors:
         return isinstance(other, self.__class__) and self
 
     def __repr__(self) -> str:
-        return f"PPProxyTensors(tensors={self.tensors})"
+        return (
+            f"PPProxyTensors(tensors={self.tensors}, "
+            f"needs_allreduce_fusion={self.needs_allreduce_fusion})"
+        )
 
 
 def compute_position(

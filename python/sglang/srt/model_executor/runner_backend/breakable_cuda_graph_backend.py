@@ -205,6 +205,7 @@ class BreakableCudaGraphBackend(DedupedCudaGraphMixin, BaseCudaGraphBackend):
         if isinstance(output, PPProxyTensors) and isinstance(
             output_buffer, PPProxyTensors
         ):
+            output_buffer.needs_allreduce_fusion = output.needs_allreduce_fusion
             if output.tensors.keys() != output_buffer.tensors.keys():
                 raise ValueError(
                     "BCG output proxy structure changed between capture sizes: "

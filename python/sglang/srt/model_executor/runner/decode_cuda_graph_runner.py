@@ -1054,6 +1054,12 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
         # that wraps the warmup/capture forward.
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+            if pp_proxy_tensors is not None:
+                pp_proxy_tensors.needs_allreduce_fusion = (
+                    self._pp_input_needs_allreduce_fusion(
+                        num_tokens, forward_batch.can_run_tbo
+                    )
+                )
 
             if forward_batch.lora_ids is not None:
                 self.model_runner.lora_manager.prepare_lora_batch(forward_batch)
@@ -1087,9 +1093,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
                     self.pp_size > 1
                     and "pp_proxy_tensors" in inspect.signature(forward).parameters
                 ):
-                    kwargs["pp_proxy_tensors"] = PPProxyTensors(
-                        {k: v.clone() for k, v in pp_proxy_tensors.tensors.items()}
-                    )
+                    kwargs["pp_proxy_tensors"] = pp_proxy_tensors.clone()
                 if (
                     self.model_runner.spec_algorithm.is_dflash_family()
                     and self.model_runner.is_draft_worker
@@ -1359,7 +1363,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             )
         else:
             assert isinstance(output, PPProxyTensors)
-            return PPProxyTensors({k: v[: self.bs] for k, v in output.tensors.items()})
+            return output[: self.bs]
 
     def get_spec_info(self, num_tokens: int):
         spec_info = None
