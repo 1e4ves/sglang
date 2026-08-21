@@ -384,7 +384,11 @@ class LayerScatterModes:
 
     @classmethod
     def _compute_mlp_mode(cls, context: _LayerModeComputationContext):
-        if context.is_layer_sparse:
+        return cls.compute_mlp_mode(context.is_layer_sparse)
+
+    @classmethod
+    def compute_mlp_mode(cls, is_layer_sparse: bool) -> ScatterMode:
+        if is_layer_sparse:
             if (
                 # Token dispatch/combine will be handled outside of LayerCommunicator for these modes.
                 not get_moe_a2a_backend().is_none()
@@ -807,7 +811,11 @@ class LayerCommunicator:
 
     # NOTE: This function will cause torch recompilation
     def should_fuse_mlp_allreduce_with_next_layer(
-        self, forward_batch: ForwardBatch
+        self,
+        forward_batch: ForwardBatch,
+        *,
+        mlp_mode: Optional[ScatterMode] = None,
+        has_next_layer: Optional[bool] = None,
     ) -> bool:
         # When MOE_FULL is active (moe_cp allgather), fusion must be disabled because
         # the fusion path skips postprocess_layer which contains the moe_cp scatter.
@@ -838,15 +846,16 @@ class LayerCommunicator:
         if get_attn_tp_context().input_scattered:
             return False
 
-        batch_size = (
-            forward_batch.input_ids.shape[0]
-            if hasattr(forward_batch, "input_ids")
-            else 0
-        )
+        batch_size = forward_batch.input_ids.shape[0]
+
+        if mlp_mode is None:
+            mlp_mode = self.layer_scatter_modes.mlp_mode
+        if has_next_layer is None:
+            has_next_layer = not self.is_last_layer
 
         # When mlp_mode is SCATTERED, the MLP runs on scattered data with no TP
         # all-reduce, so there is nothing to fuse with the next layer.
-        if self.layer_scatter_modes.mlp_mode == ScatterMode.SCATTERED:
+        if mlp_mode == ScatterMode.SCATTERED:
             return False
 
         return (
@@ -861,7 +870,7 @@ class LayerCommunicator:
                     and get_exec().comm.enable_aiter_allreduce_fusion
                 )
             )
-            and (not self.is_last_layer)
+            and has_next_layer
             and (self._context.tp_size > 1)
         )
 

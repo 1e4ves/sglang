@@ -1056,9 +1056,7 @@ class DecodeCudaGraphRunner(BaseCudaGraphRunner):
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
             if pp_proxy_tensors is not None:
                 pp_proxy_tensors.needs_allreduce_fusion = (
-                    self._pp_input_needs_allreduce_fusion(
-                        num_tokens, forward_batch.can_run_tbo
-                    )
+                    self._pp_input_needs_allreduce_fusion(forward_batch)
                 )
 
             if forward_batch.lora_ids is not None:

@@ -229,22 +229,16 @@ class BaseRunner(ABC):
         self.attn_tp_rank = get_parallel().attn_tp_rank
         self.tbo_plugin = TboCudaGraphRunnerPlugin()
 
-    def _pp_allreduce_fusion(self, num_tokens: int, can_run_tbo: bool) -> bool:
-        if self.pp_size <= 1:
+    def _pp_input_needs_allreduce_fusion(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        if self.pp_size <= 1 or self.model_runner.pp_group.is_first_rank:
             return False
 
         model = self.model_runner.model
         if not isinstance(model, PPAllReduceFusionSupport):
             return False
-        return bool(model.get_pp_allreduce_fusion(num_tokens, can_run_tbo))
-
-    def _pp_input_needs_allreduce_fusion(
-        self, num_tokens: int, can_run_tbo: bool
-    ) -> bool:
-        return (
-            not self.model_runner.pp_group.is_first_rank
-            and self._pp_allreduce_fusion(num_tokens, can_run_tbo)
-        )
+        return bool(model.get_pp_allreduce_fusion_for_capture(forward_batch))
 
     def warmup(self) -> None:
         """Run kernel warmup + autotune once, gated by mr._kernel_warmed_up."""
@@ -645,10 +639,7 @@ class BaseRunner(ABC):
         mr.attn_backend.init_forward_metadata(forward_batch)
         if pp_proxy_tensors is not None:
             pp_proxy_tensors.needs_allreduce_fusion = (
-                self._pp_input_needs_allreduce_fusion(
-                    forward_batch.input_ids.shape[0],
-                    forward_batch.can_run_tbo,
-                )
+                self._pp_input_needs_allreduce_fusion(forward_batch)
             )
 
         def run_once():

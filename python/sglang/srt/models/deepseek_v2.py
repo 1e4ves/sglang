@@ -75,7 +75,6 @@ from sglang.srt.layers.aux_hidden_states import (
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
     LayerScatterModes,
-    apply_flashinfer_allreduce_fusion,
     enable_moe_dense_fully_dp,
     get_attn_tp_context,
 )
@@ -88,7 +87,6 @@ from sglang.srt.layers.cp.utils import is_cp_v2_active
 from sglang.srt.layers.dcp.planner import (
     prepare_decode_context_parallel_metadata,
 )
-from sglang.srt.layers.dp_attention import is_enable_moe_cp_allgather
 from sglang.srt.layers.layernorm import RMSNorm
 from sglang.srt.layers.linear import (
     ColumnParallelLinear,
@@ -2344,6 +2342,9 @@ class DeepseekV2DecoderLayer(nn.Module):
             is_previous_layer_sparse=is_previous_layer_sparse,
             is_next_layer_sparse=is_next_layer_sparse,
         )
+        self.previous_layer_mlp_mode = LayerScatterModes.compute_mlp_mode(
+            is_previous_layer_sparse
+        )
 
         if self.is_layer_sparse:
             self.mlp = DeepseekV2MoE(
@@ -2752,25 +2753,28 @@ class DeepseekV2Model(nn.Module):
         backend = getattr(backend, "primary", backend)
         return not getattr(backend, "use_mha", False)
 
-    def get_pp_allreduce_fusion(
-        self, num_tokens: int, can_run_tbo: bool
+    def get_pp_allreduce_fusion_for_capture(
+        self, forward_batch: ForwardBatch
     ) -> bool:
-        """Return whether a PP boundary defers its all-reduce to the next stage."""
         if (
-            can_run_tbo
+            self.pp_group.is_first_rank
+            or forward_batch.can_run_tbo
             or self.dsa_enable_prefill_cp
             or self.mla_enable_prefill_cp
-            or is_enable_moe_cp_allgather()
-            or not get_moe_a2a_backend().is_none()
-            or get_attn_tp_context().input_scattered
         ):
             return False
 
-        parallel = get_parallel()
-        if parallel.moe_ep_size > 1 and parallel.moe_tp_size > 1:
-            return False
-
-        return parallel.tp_size > 1 and apply_flashinfer_allreduce_fusion(num_tokens)
+        # The producer layer lives on the previous PP rank. Reuse the first
+        # local layer's communicator with the producer's MLP mode and the
+        # known cross-stage successor instead of duplicating its fusion gates.
+        first_local_layer = self.layers[self.start_layer]
+        return (
+            first_local_layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch,
+                mlp_mode=first_local_layer.previous_layer_mlp_mode,
+                has_next_layer=True,
+            )
+        )
 
     def forward(
         self,
@@ -3105,10 +3109,10 @@ class DeepseekV2ForCausalLM(
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
-    def get_pp_allreduce_fusion(
-        self, num_tokens: int, can_run_tbo: bool
+    def get_pp_allreduce_fusion_for_capture(
+        self, forward_batch: ForwardBatch
     ) -> bool:
-        return self.model.get_pp_allreduce_fusion(num_tokens, can_run_tbo)
+        return self.model.get_pp_allreduce_fusion_for_capture(forward_batch)
 
     @torch.no_grad()
     def forward(
