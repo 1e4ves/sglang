@@ -75,11 +75,14 @@ def _resolve_backend(backend: str, is_multi_node: bool = False) -> str:
     return backend
 
 
-def resolve_flashinfer_allreduce_fusion_backend(server_args) -> Optional[str]:
-    backend = getattr(server_args, "flashinfer_allreduce_fusion_backend", None)
+def resolve_flashinfer_allreduce_fusion_backend(
+    server_args, is_multi_node: Optional[bool] = None
+) -> Optional[str]:
+    backend = server_args.flashinfer_allreduce_fusion_backend
     if backend is None:
         return None
-    is_multi_node = getattr(server_args, "nnodes", 1) > 1
+    if is_multi_node is None:
+        is_multi_node = server_args.nnodes > 1
     return _resolve_backend(backend, is_multi_node)
 
 
@@ -471,11 +474,15 @@ class FlashInferWorkspaceManager:
             self.initialized = False
             return
 
-        # Determine GPUs per node for MNNVL topology detection
+        # Determine whether this collective group, rather than the full job,
+        # crosses nodes. Cross-node PP can still keep each TP group local.
         gpus_per_node = None
+        group_is_multi_node = False
         node_pg = cpu_group if cpu_group is not None else group
         if node_pg is not None:
-            gpus_per_node = sum(in_the_same_node_as(node_pg, source_rank=0))
+            same_node = in_the_same_node_as(node_pg, source_rank=0)
+            gpus_per_node = sum(same_node)
+            group_is_multi_node = not all(same_node)
         comm_backend = None
         if (
             _TorchDistBackend is not None
@@ -489,6 +496,7 @@ class FlashInferWorkspaceManager:
             comm_backend = _mnnvl_comm_backend(group)
 
         try:
+            backend = _resolve_backend(backend, group_is_multi_node)
             alloc_token_num = max(max_token_num, self._max_token_num_seen or 0)
             alloc_hidden_dim = max(hidden_dim, self._max_hidden_dim_seen or 0)
             create_kw = dict(
@@ -708,7 +716,7 @@ def ensure_workspace_initialized(
     group_key = (device_group, cpu_group)
     effective_dtype = dtype or torch.bfloat16
     server_args = get_server_args()
-    backend = resolve_flashinfer_allreduce_fusion_backend(server_args)
+    backend = server_args.flashinfer_allreduce_fusion_backend
     if backend is None:
         return False
 

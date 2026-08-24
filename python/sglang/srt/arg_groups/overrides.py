@@ -1946,10 +1946,10 @@ _FLASHINFER_ALLREDUCE_FUSION_ARCHS = frozenset(
 def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
     """Slot pass at the monolith tail: auto-enable FlashInfer AllReduce
     Fusion on SM90/SM100 for models with explicit support. auto resolves to
-    mnnvl on Blackwell (single- and multi-node) and trtllm on SM90
-    single-node systems. Reads the mid-resolution enable_dp_attention /
-    moe_a2a_backend (after the DeepSeek CP and a2a declarations), exactly
-    like the legacy tail block."""
+    mnnvl on Blackwell (single- and multi-node) and trtllm for SM90
+    collectives contained within one node. Reads the mid-resolution
+    enable_dp_attention / moe_a2a_backend (after the DeepSeek CP and a2a
+    declarations), exactly like the legacy tail block."""
     model_arch = view.get_model_config().hf_config.architectures[0]
     if (
         view.flashinfer_allreduce_fusion_backend is None
@@ -1957,7 +1957,11 @@ def _flashinfer_allreduce_fusion_auto_enable(view: Any) -> dict:
         and (is_sm90_supported() or is_sm100_supported())
         and view.tp_size > 1
         and not view.enable_dp_attention
-        and (view.nnodes == 1 or is_sm100_supported())
+        and (
+            view.nnodes == 1
+            or is_sm100_supported()
+            or view.pp_size > 1
+        )
         and view.moe_a2a_backend == "none"
     ):
         logger.info(
