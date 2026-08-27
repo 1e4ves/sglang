@@ -363,7 +363,6 @@ TEST_RETRACT = envs.SGLANG_TEST_RETRACT.get()
 TEST_RETRACT_INTERVAL = envs.SGLANG_TEST_RETRACT_INTERVAL.get()
 TEST_RETRACT_NO_PREFILL_BS = envs.SGLANG_TEST_RETRACT_NO_PREFILL_BS.get()
 
-
 STEP_MAX_US = 2_000_000
 
 
@@ -3365,6 +3364,21 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        if self.server_args.enable_unified_cache_external_linker:
+            # Keep Mooncake leases bounded to requests that admission can
+            # plausibly consume next. PP0 canonicalizes this window; prepare
+            # itself runs asynchronously and match_prefix remains network-free.
+            linker_window = min(
+                max(1, self.get_num_allocatable_reqs(running_bs)),
+                self.tree_cache.linker_prepare_max_requests,
+            )
+            prefill_cap = get_schedule().prefill_max_requests
+            if prefill_cap is not None:
+                linker_window = min(linker_window, prefill_cap)
+            self.tree_cache.prepare_linker_requests(
+                self.waiting_queue, linker_window
+            )
+
         if self.chunked_req is not None:
             self.chunked_req.init_next_round_input()
             self.chunked_req = adder.add_chunked_req(self.chunked_req)
@@ -3387,6 +3401,13 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         # Get requests from the waiting queue to a new prefill batch
         for req in self.waiting_queue:
+            if (
+                self.server_args.enable_unified_cache_external_linker
+                and not self.tree_cache.linker_prepare_ready(req)
+            ):
+                # Same scheduling contract as an in-progress HiCache prefetch:
+                # keep scanning, but never admit an unprepared L3 candidate.
+                continue
             if self.enable_lora and not self._can_schedule_lora_req(req, running_loras):
                 continue
 

@@ -6,10 +6,10 @@ from concurrent.futures import Future
 from queue import Empty, Queue
 
 import torch
-
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
+    PoolHitPolicy,
     PoolName,
     PoolTransfer,
 )
@@ -130,6 +130,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 self.layer_done_counter
             )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
+        self._read_session_lock = threading.Lock()
+        self._read_sessions: dict[str, tuple[str, ...]] = {}
+        self._read_key_ref_counts: dict[str, int] = {}
         self.gc_frozen = False
         self.load_queue: Queue[
             tuple[int, dict[str, list[PoolTransfer]], object] | None
@@ -189,6 +192,167 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             )
         return restorable
 
+    def _ensure_read_session_state(self) -> None:
+        # Keep helpers usable in focused tests that construct via ``__new__``.
+        if not hasattr(self, "_read_session_lock"):
+            self._read_session_lock = threading.Lock()
+            self._read_sessions = {}
+            self._read_key_ref_counts = {}
+
+    def prepare_read(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
+        """Atomically query and acquire Mooncake read leases for a request."""
+        expanded = self.pool_group.resolve_transfers(transfers)
+        if not expanded:
+            return []
+        kv = next(transfer for transfer in transfers if transfer.name == PoolName.KV)
+        page_keys = list(kv.keys or [])
+        if not page_keys:
+            return []
+
+        self._ensure_read_session_state()
+        physical_keys = []
+        for transfer in expanded:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                page_keys, transfer
+            )
+            physical_keys.extend(self.storage._tag_keys(component_keys))
+        physical_keys = list(dict.fromkeys(physical_keys))
+
+        with self._read_session_lock:
+            if rid in self._read_sessions:
+                raise RuntimeError(f"Mooncake read for rid={rid} is already prepared.")
+            reused = [
+                key for key in physical_keys if self._read_key_ref_counts.get(key, 0)
+            ]
+            reused_set = set(reused)
+            for key in reused:
+                self._read_key_ref_counts[key] += 1
+            new_keys = [key for key in physical_keys if key not in reused_set]
+
+        acquired_new = []
+        try:
+            if new_keys:
+                statuses = list(self.storage.store.batch_get_session_start(new_keys))
+                if len(statuses) != len(new_keys):
+                    raise RuntimeError(
+                        "Mooncake get session start result-size mismatch: "
+                        f"expected={len(new_keys)} actual={len(statuses)}"
+                    )
+                acquired_new = [
+                    key for key, status in zip(new_keys, statuses) if status == 0
+                ]
+            with self._read_session_lock:
+                for key in acquired_new:
+                    self._read_key_ref_counts[key] = 1
+                acquired = tuple(reused + acquired_new)
+                self._read_sessions[rid] = acquired
+        except BaseException:
+            with self._read_session_lock:
+                for key in reused:
+                    count = self._read_key_ref_counts[key] - 1
+                    if count:
+                        self._read_key_ref_counts[key] = count
+                    else:
+                        self._read_key_ref_counts.pop(key, None)
+            if acquired_new:
+                self.storage.store.batch_get_session_end(acquired_new)
+            raise
+
+        acquired_set = set(acquired)
+        valid_pages = list(range(1, len(page_keys) + 1))
+        for transfer in expanded:
+            component_keys, key_multiplier = (
+                self.storage._get_hybrid_page_component_keys(page_keys, transfer)
+            )
+            component_keys = self.storage._tag_keys(component_keys)
+            page_exists = [
+                all(
+                    key in acquired_set
+                    for key in component_keys[
+                        index * key_multiplier : (index + 1) * key_multiplier
+                    ]
+                )
+                for index in range(len(page_keys))
+            ]
+            valid_pages = self._apply_hit_policy(
+                valid_pages, page_exists, transfer
+            )
+            if not valid_pages:
+                break
+
+        self.stats["lookup"] += 1
+        if valid_pages:
+            logger.info(
+                "Mooncake direct linker prepare hit: rid=%s pages=%d candidates=%d",
+                rid,
+                valid_pages[-1],
+                len(valid_pages),
+            )
+        return valid_pages
+
+    @staticmethod
+    def _apply_hit_policy(
+        valid_pages: list[int], page_exists: list[bool], transfer: PoolTransfer
+    ) -> list[int]:
+        present_prefix = [0]
+        for present in page_exists:
+            present_prefix.append(present_prefix[-1] + int(present))
+        if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
+            return [end for end in valid_pages if present_prefix[end] == end]
+        if transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
+            trailing = max(1, len(transfer.keys or ()))
+            return [
+                end
+                for end in valid_pages
+                if present_prefix[end] - present_prefix[max(0, end - trailing)]
+                == end - max(0, end - trailing)
+            ]
+        raise ValueError(f"Unsupported pool hit policy: {transfer.hit_policy}")
+
+    def release_read(self, rid: str) -> None:
+        self._ensure_read_session_state()
+        with self._read_session_lock:
+            keys = self._read_sessions.pop(rid, ())
+            ending = []
+            for key in keys:
+                count = self._read_key_ref_counts[key] - 1
+                if count:
+                    self._read_key_ref_counts[key] = count
+                else:
+                    self._read_key_ref_counts.pop(key, None)
+                    ending.append(key)
+        if ending:
+            self.storage.store.batch_get_session_end(ending)
+
+    def retain_read(self, rid: str, transfers: list[PoolTransfer]) -> None:
+        """Keep only physical objects needed by the agreed load boundary."""
+        expanded = self.pool_group.resolve_transfers(transfers)
+        retained_keys = set()
+        for transfer in expanded:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            retained_keys.update(self.storage._tag_keys(component_keys))
+
+        self._ensure_read_session_state()
+        with self._read_session_lock:
+            current = self._read_sessions.get(rid)
+            if current is None:
+                return
+            retained = tuple(key for key in current if key in retained_keys)
+            releasing = [key for key in current if key not in retained_keys]
+            self._read_sessions[rid] = retained
+            ending = []
+            for key in releasing:
+                count = self._read_key_ref_counts[key] - 1
+                if count:
+                    self._read_key_ref_counts[key] = count
+                else:
+                    self._read_key_ref_counts.pop(key, None)
+                    ending.append(key)
+        if ending:
+            self.storage.store.batch_get_session_end(ending)
+
     def load(self, rid: str, transfers: list[PoolTransfer]) -> bool:
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
@@ -200,11 +364,28 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             return False
         if rid in self.pending_loads:
             raise RuntimeError(f"Mooncake load for rid={rid} is already queued.")
+        self._ensure_read_session_state()
+        with self._read_session_lock:
+            ticket_keys = set(self._read_sessions.get(rid, ()))
+        if not ticket_keys:
+            raise RuntimeError(f"Mooncake load for rid={rid} has no prepared read.")
+        for transfer in expanded:
+            component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                list(transfer.keys), transfer
+            )
+            missing = set(self.storage._tag_keys(component_keys)) - ticket_keys
+            if missing:
+                raise RuntimeError(
+                    f"Mooncake load for rid={rid} uses {len(missing)} unleased keys."
+                )
         self.pending_loads[rid] = expanded
         return True
 
     def cancel_queued_load(self, rid: str) -> bool:
-        return self.pending_loads.pop(rid, None) is not None
+        canceled = self.pending_loads.pop(rid, None) is not None
+        if canceled:
+            self.release_read(rid)
+        return canceled
 
     def num_completed_loads(self) -> int:
         return self.completed_loads.qsize()
@@ -243,19 +424,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 counter_index, pending, ready_event = task
                 try:
                     ready_event.synchronize()
-                    self.load_layer_wise(counter_index, list(pending.values()))
+                    self.load_layer_wise(counter_index, pending)
                 finally:
                     self.completed_loads.put(list(pending))
             finally:
                 self.load_queue.task_done()
 
     def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+        self, counter_index: int, pending: dict[str, list[PoolTransfer]]
     ) -> None:
-        started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
-            for transfers in request_transfers:
+            for transfers in pending.values():
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
                     component_keys, _ = self.storage._get_hybrid_page_component_keys(
@@ -267,15 +447,6 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                             transfer.host_indices
                         )
                     )
-            for keys, _ in batches.values():
-                result = self.storage.store.batch_get_session_start(keys)
-                if list(result) != [0] * len(keys):
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"results={result}"
-                    )
-                started.append(keys)
-
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
                     meta = self.pools[name].get_prepared_layer_range_meta(
@@ -306,9 +477,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             self.layer_done_counter.fail(counter_index, error)
             logger.exception("Mooncake layer-wise load batch failed")
         finally:
-            for keys in started:
+            for rid in pending:
                 try:
-                    self.storage.store.batch_get_session_end(keys)
+                    self.release_read(rid)
                 except BaseException as error:
                     self.layer_done_counter.fail(counter_index, error)
                     logger.exception("Mooncake layer-wise load session cleanup failed")
@@ -353,9 +524,22 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         return self.offload_results.get_nowait()
 
     def reset(self) -> None:
+        self._ensure_read_session_state()
+        queued_rids = list(self.pending_loads)
         self.pending_loads.clear()
+        for rid in queued_rids:
+            try:
+                self.release_read(rid)
+            except BaseException:
+                logger.exception("Mooncake queued-read reset cleanup failed: rid=%s", rid)
+        # In-flight load workers own their sessions until this join returns.
         self.load_queue.join()
         self.offload_queue.join()
+        for rid in list(self._read_sessions):
+            try:
+                self.release_read(rid)
+            except BaseException:
+                logger.exception("Mooncake read-session reset cleanup failed: rid=%s", rid)
         while True:
             try:
                 self.offload_results.get_nowait()

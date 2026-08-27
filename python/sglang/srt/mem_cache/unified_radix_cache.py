@@ -9,7 +9,6 @@ from queue import Empty, Queue
 from typing import TYPE_CHECKING, Iterator, NamedTuple, Optional, Sequence, TypeVar
 
 import torch
-
 from sglang.srt.distributed.communication_tags import P2PTag
 from sglang.srt.environ import envs
 from sglang.srt.managers.cache_controller import CacheOperation
@@ -149,6 +148,9 @@ class _OngoingPrefetch(NamedTuple):
 
 
 class UnifiedRadixCache(BasePrefixCache):
+    # Bound speculative external-cache reads independently of request-pool size.
+    linker_prepare_max_requests = 16
+
     def __init__(
         self,
         params: CacheInitParams,
@@ -344,6 +346,58 @@ class UnifiedRadixCache(BasePrefixCache):
     ) -> None:
         """Attach an external KV store directly to the device pools (direct L3)."""
         self.linker = UnifiedCacheLinkerWrapper(self, server_args, params)
+
+    def prepare_linker_requests(
+        self, requests: Sequence[Req], window_size: int
+    ) -> None:
+        """Publish PP0's head window to the direct-linker prepare worker."""
+        if self.linker is None or window_size <= 0:
+            return
+        window_size = min(window_size, self.linker_prepare_max_requests)
+
+        manifest = (
+            self.linker.build_prepare_manifest(requests, window_size)
+            if self.pp_rank == 0
+            else []
+        )
+        if self.pp_size > 1:
+            # The scheduler bounds window_size, so count and records fit in one
+            # fixed-shape PP message (avoids a count round trip followed by a
+            # dynamically-sized payload round trip).
+            payload = torch.zeros(
+                1 + self.linker_prepare_max_requests * 5,
+                dtype=torch.int64,
+                device="cpu",
+            )
+            if self.pp_rank == 0:
+                payload[0] = len(manifest)
+                if manifest:
+                    payload[1 : 1 + len(manifest) * 5].copy_(
+                        torch.tensor(manifest, dtype=torch.int64).reshape(-1)
+                    )
+            self._pp_sync(payload)
+            manifest_count = int(payload[0].item())
+            if manifest_count:
+                flat = payload[1 : 1 + manifest_count * 5]
+                manifest = [
+                    (
+                        int(flat[index]),
+                        int(flat[index + 1]),
+                        int(flat[index + 2]),
+                        int(flat[index + 3]),
+                        int(flat[index + 4]),
+                    )
+                    for index in range(0, flat.numel(), 5)
+                ]
+            else:
+                manifest = []
+        self.linker.reconcile_prepare_window({entry[0] for entry in manifest})
+        self.linker.enqueue_prepare_manifest(
+            [entry[:4] for entry in manifest if entry[4]], requests
+        )
+
+    def linker_prepare_ready(self, req: Req) -> bool:
+        return self.linker is None or self.linker.prepare_ready(req)
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -2607,7 +2661,19 @@ class UnifiedRadixCache(BasePrefixCache):
     def check_hicache_events(self) -> None:
         """Called per scheduler step to poll async HiCache events."""
         if self.linker is not None:
-            finish_counts = torch.tensor(
+            self._drain_async_work()
+            # A prepare result is published only after its dedicated background
+            # CP/TP/PP collectives finish, so PP0 may drive FIFO consumption.
+            prepare_count = torch.tensor(
+                self.linker.num_completed_prepares(), dtype=torch.int, device="cpu"
+            )
+            self._all_reduce(prepare_count, torch.distributed.ReduceOp.MIN)
+            self.linker.drain_prepares(int(prepare_count.item()))
+
+            # Loads and offloads do not have a background PP collective. Keep
+            # the original per-stage attention-rank MIN instead of letting a
+            # faster PP stage make a slower stage pop a result prematurely.
+            io_finish_counts = torch.tensor(
                 [
                     self.linker.num_completed_loads(),
                     self.linker.num_completed_offloads(),
@@ -2615,13 +2681,17 @@ class UnifiedRadixCache(BasePrefixCache):
                 dtype=torch.int,
                 device="cpu",
             )
-            self._all_reduce_attn_groups(finish_counts, torch.distributed.ReduceOp.MIN)
-            load_count, offload_count = map(int, finish_counts.tolist())
+            self._all_reduce_attn_groups(
+                io_finish_counts, torch.distributed.ReduceOp.MIN
+            )
+            load_count, offload_count = map(int, io_finish_counts.tolist())
             self.linker.drain_loads(load_count)
             local_successes = self.linker.take_completed_offloads(offload_count)
             if local_successes:
                 successes = torch.tensor(local_successes, dtype=torch.int, device="cpu")
-                self._all_reduce_attn_groups(successes, torch.distributed.ReduceOp.MIN)
+                self._all_reduce_attn_groups(
+                    successes, torch.distributed.ReduceOp.MIN
+                )
                 self.linker.commit_completed_offloads(
                     [bool(success) for success in successes.tolist()]
                 )
