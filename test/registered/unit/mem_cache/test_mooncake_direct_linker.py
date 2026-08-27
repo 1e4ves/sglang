@@ -5,8 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-
-from sglang.srt.mem_cache.base_prefix_cache import InsertResult
+from sglang.srt.mem_cache.base_prefix_cache import InsertResult, MatchResult
 from sglang.srt.mem_cache.hicache_storage import (
     PoolHitPolicy,
     PoolName,
@@ -35,6 +34,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
     UnifiedCacheLinkerWrapper,
+    _PreparedRead,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -137,6 +137,107 @@ def test_lookup_returns_sparse_mamba_boundaries():
         ],
     )
     assert valid == [2, 4]
+
+
+def test_prepare_read_acquires_sparse_objects_until_release():
+    starts = []
+    ends = []
+
+    class _Store:
+        def batch_get_session_start(self, keys):
+            starts.append(list(keys))
+            return [
+                int(not (key.endswith("_kv") or key[0] in ("b", "d")))
+                for key in keys
+            ]
+
+        def batch_get_session_end(self, keys):
+            ends.append(list(keys))
+
+    linker = MooncakeDirectLinker.__new__(MooncakeDirectLinker)
+    pools = [
+        SimpleNamespace(
+            name=name,
+            indices_from_pool=name,
+            translate_indices=lambda indices: indices,
+        )
+        for name in (PoolName.KV, PoolName.MAMBA)
+    ]
+    linker.pool_group = DevicePoolGroup(pools, num_layers=4, page_size=1)
+    linker.pools = linker.pool_group.entry_map
+    linker.stats = {"lookup": 0}
+    linker.storage = SimpleNamespace(
+        store=_Store(),
+        _get_hybrid_page_component_keys=lambda keys, transfer: (
+            [f"{key}_{transfer.name}" for key in keys],
+            1,
+        ),
+        _tag_keys=lambda keys: keys,
+    )
+    transfers = [
+        PoolTransfer(name=PoolName.KV, keys=["a", "b", "c", "d"]),
+        PoolTransfer(
+            name=PoolName.MAMBA,
+            keys=["d"],
+            hit_policy=PoolHitPolicy.TRAILING_PAGES,
+        ),
+    ]
+
+    assert linker.prepare_read("first", transfers) == [2, 4]
+    assert linker.prepare_read("second", transfers) == [2, 4]
+    assert len(starts) == 2
+    assert all(key.endswith("_mamba") for key in starts[1])
+
+    linker.release_read("first")
+    assert ends == []
+    linker.release_read("second")
+    assert set(ends[0]) == {
+        "a_kv",
+        "b_kv",
+        "c_kv",
+        "d_kv",
+        "b_mamba",
+        "d_mamba",
+    }
+
+
+def test_match_consumes_prepared_result_without_backend_lookup():
+    released = []
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(page_size=1)
+    wrapper.cache_linker = SimpleNamespace(
+        release_read=lambda rid: released.append(rid)
+    )
+    wrapper.hit_markers = {}
+    key = RadixKey(array("q", [1, 2, 3, 4]))
+    hashes = wrapper._full_page_hashes(key)
+    request_id = wrapper.request_id("rid")
+    wrapper._prepared_reads = {
+        request_id: _PreparedRead(
+            request_id=request_id,
+            rid="rid",
+            page_hashes=hashes[1:],
+            start_page=1,
+            num_pages=3,
+            local_restorable=(1, 2),
+            common_pages=2,
+            swa_window_pages=0,
+            read_held=True,
+        )
+    }
+    node = object()
+    result = MatchResult(
+        device_indices=torch.tensor([7]),
+        last_device_node=node,
+        last_host_node=node,
+        best_match_node=node,
+    )
+
+    matched = wrapper.match(key, SimpleNamespace(rid="rid"), result)
+
+    assert matched.host_hit_length == 2
+    assert wrapper.hit_markers["rid"].tail_hashes == list(hashes[1:3])
+    assert released == []
 
 
 def test_tail_hashes_honor_radix_key_limit():
@@ -400,6 +501,8 @@ def test_check_hicache_events_drains_common_tp_offloads():
     committed = []
     cache = UnifiedRadixCache.__new__(UnifiedRadixCache)
     cache.linker = SimpleNamespace(
+        num_completed_prepares=lambda: 2,
+        drain_prepares=lambda count: committed.append(("prepare", count)),
         num_completed_loads=lambda: 1,
         drain_loads=lambda count: committed.append(("load", count)),
         num_completed_offloads=lambda: 3,
@@ -407,9 +510,15 @@ def test_check_hicache_events_drains_common_tp_offloads():
         commit_completed_offloads=committed.append,
     )
 
+    cache._drain_async_work = lambda: None
+
+    def reduce_prepare_to_common_state(value, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        value.fill_(1)
+
     reduce_calls = 0
 
-    def reduce_to_common_state(value, op):
+    def reduce_io_to_common_state(value, op):
         nonlocal reduce_calls
         assert op == torch.distributed.ReduceOp.MIN
         reduce_calls += 1
@@ -418,10 +527,11 @@ def test_check_hicache_events_drains_common_tp_offloads():
         else:
             value.fill_(0)
 
-    cache._all_reduce_attn_groups = reduce_to_common_state
+    cache._all_reduce = reduce_prepare_to_common_state
+    cache._all_reduce_attn_groups = reduce_io_to_common_state
     cache.check_hicache_events()
 
-    assert committed == [("load", 1), [False]]
+    assert committed == [("prepare", 1), ("load", 1), [False]]
 
 
 def test_deepseek_v4_device_pool_group_maps_sparse_sidecars():
