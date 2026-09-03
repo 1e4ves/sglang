@@ -3365,9 +3365,9 @@ class Scheduler(
         )
 
         if self.server_args.enable_unified_cache_external_linker:
-            # PP0 canonicalizes a bounded lookup/acquire window.  With PP, the
-            # waiting phase only looks up H; session_start is requested later
-            # by the admission-time match and still runs on the CPU worker.
+            # PP0 canonicalizes a bounded lookup window. With PP, lookup holds
+            # no session; the admission-time match later runs one acquire on
+            # the CPU worker and synchronously waits for its common boundary.
             linker_window = min(
                 max(1, self.get_num_allocatable_reqs(running_bs)),
                 self.tree_cache.linker_prepare_max_requests,
@@ -3441,15 +3441,6 @@ class Scheduler(
                 self.tree_cache,
                 linker_prefill_admission=(self.tree_cache.pp_size > 1),
             )
-            if (
-                self.server_args.enable_unified_cache_external_linker
-                and self.tree_cache.pp_size > 1
-                and not self.tree_cache.linker_prepare_ready(req)
-            ):
-                # This match changed LOOKUP_READY into ACQUIRE_PENDING. PP0
-                # publishes it on the next control round; do not admit until
-                # every rank has acquired and agreed on H_session.
-                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"

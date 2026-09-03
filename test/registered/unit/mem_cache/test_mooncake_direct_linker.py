@@ -252,7 +252,7 @@ def test_match_consumes_prepared_result_without_backend_lookup():
     assert released == []
 
 
-def test_pp_lookup_is_pure_until_admission_requests_acquire():
+def test_pp_lookup_is_pure_until_admission_acquires():
     wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
     wrapper.cache = SimpleNamespace(
         page_size=1,
@@ -263,7 +263,6 @@ def test_pp_lookup_is_pure_until_admission_requests_acquire():
     wrapper._pp_prefill_protocol = True
     wrapper._prepare_pending = {}
     wrapper._prepared_reads = {}
-    wrapper._acquire_requested_ids = set()
     wrapper._next_prepare_sequence = 1
     wrapper.hit_markers = {}
     req = SimpleNamespace(
@@ -304,16 +303,36 @@ def test_pp_lookup_is_pure_until_admission_requests_acquire():
         last_host_node=node,
         best_match_node=node,
     )
+    wrapper.cache.match_prefix = lambda params: result
+    acquire_calls = []
+
+    def acquire_for_admission(acquire_req, lookup_result):
+        acquire_calls.append((acquire_req.rid, lookup_result.common_pages))
+        acquired = _PreparedRead(
+            request_id=request_id,
+            sequence=lookup[2],
+            signature=lookup[1],
+            rid=req.rid,
+            page_hashes=hashes[:3],
+            start_page=0,
+            num_pages=3,
+            local_restorable=(1, 2, 3),
+            common_pages=3,
+            swa_window_pages=0,
+            acquired=True,
+            read_held=True,
+        )
+        wrapper._prepared_reads[request_id] = acquired
+        return acquired
+
+    wrapper._acquire_for_admission = acquire_for_admission
 
     wrapper.match(key, req, result, prefill_admission=False)
-    assert request_id not in wrapper._acquire_requested_ids
-    wrapper.match(key, req, result, prefill_admission=True)
-    assert request_id in wrapper._acquire_requested_ids
+    assert acquire_calls == []
 
-    acquire = wrapper.build_prepare_manifest([req], 1)[0]
-    assert acquire[-1] == _PrepareOperation.ACQUIRE
-    assert acquire[3:5] == (0, 3)
-    assert acquire[2] > lookup[2]
+    matched = wrapper.match(key, req, result, prefill_admission=True)
+    assert acquire_calls == [("rid", 3)]
+    assert matched.host_hit_length == 3
 
 
 def test_tail_hashes_honor_radix_key_limit():

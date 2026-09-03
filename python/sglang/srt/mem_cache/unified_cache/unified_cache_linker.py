@@ -193,6 +193,8 @@ class _PrepareItem:
 @dataclass
 class _PrepareBatch:
     items: list[_PrepareItem]
+    completion: threading.Event | None = None
+    results: list[_PreparedRead] | None = None
 
 
 class DevicePoolEntry:
@@ -444,7 +446,6 @@ class UnifiedCacheLinkerWrapper:
         self._rid_to_request_id: dict[str, int] = {}
         self._released_prepare_sequences: set[tuple[int, int]] = set()
         self._active_prepare_ids: set[int] = set()
-        self._acquire_requested_ids: set[int] = set()
         self._next_prepare_sequence = 1
         self._prepare_queue: Queue[_PrepareBatch | None] = Queue()
         self._prepare_results: Queue[list[_PreparedRead]] = Queue()
@@ -592,7 +593,6 @@ class UnifiedCacheLinkerWrapper:
                 prepared = self._prepared_reads.pop(request_id, None)
                 if prepared is not None:
                     self._discard_prepared(prepared)
-                self._acquire_requested_ids.discard(request_id)
                 manifest.append((request_id, signature, 0, start_page, 0, 0))
                 continue
 
@@ -608,7 +608,6 @@ class UnifiedCacheLinkerWrapper:
             ):
                 self._discard_prepared(prepared)
                 self._prepared_reads.pop(request_id, None)
-                self._acquire_requested_ids.discard(request_id)
                 prepared = None
 
             pending = self._prepare_pending.get(request_id)
@@ -624,16 +623,6 @@ class UnifiedCacheLinkerWrapper:
                     else _PrepareOperation.ACQUIRE
                 )
                 num_pages = len(page_hashes)
-            elif (
-                self._pp_prefill_protocol
-                and not prepared.acquired
-                and prepared.common_pages > 0
-                and request_id in self._acquire_requested_ids
-            ):
-                sequence = self._new_prepare_sequence()
-                operation = _PrepareOperation.ACQUIRE
-                # Revalidate and lock only the boundary agreed by lookup.
-                num_pages = prepared.common_pages
             else:
                 sequence = prepared.sequence
                 operation = _PrepareOperation.NONE
@@ -660,7 +649,6 @@ class UnifiedCacheLinkerWrapper:
         for request_id, pending in self._prepare_pending.items():
             if request_id not in active_request_ids:
                 self._released_prepare_sequences.add((request_id, pending[0]))
-        self._acquire_requested_ids.intersection_update(active_request_ids)
         for rid, request_id in list(self._rid_to_request_id.items()):
             if request_id not in active_request_ids:
                 self._rid_to_request_id.pop(rid, None)
@@ -959,7 +947,11 @@ class UnifiedCacheLinkerWrapper:
                             anchor_lock_params=item.anchor_lock_params,
                         )
                     )
-                self._prepare_results.put(results)
+                if batch.completion is None:
+                    self._prepare_results.put(results)
+                else:
+                    batch.results = results
+                    batch.completion.set()
             except BaseException:
                 logger.exception("External linker prepare batch failed")
                 for item in batch.items:
@@ -974,29 +966,32 @@ class UnifiedCacheLinkerWrapper:
                                 "External linker failed-batch cleanup failed: rid=%s",
                                 item.rid,
                             )
-                # Keep one completion per enqueued batch so scheduler-side PP
-                # consumption cannot lose FIFO alignment.
-                self._prepare_results.put(
-                    [
-                        _PreparedRead(
-                            request_id=item.request_id,
-                            sequence=item.sequence,
-                            signature=item.signature,
-                            rid=item.rid,
-                            page_hashes=item.page_hashes,
-                            start_page=item.start_page,
-                            num_pages=item.num_pages,
-                            local_restorable=(),
-                            common_pages=0,
-                            swa_window_pages=0,
-                            acquired=item.operation == _PrepareOperation.ACQUIRE,
-                            read_held=False,
-                            anchor_node=item.anchor_node,
-                            anchor_lock_params=item.anchor_lock_params,
-                        )
-                        for item in batch.items
-                    ]
-                )
+                # Complete through the same channel as the successful path so
+                # neither async polling nor a blocking admission can hang.
+                results = [
+                    _PreparedRead(
+                        request_id=item.request_id,
+                        sequence=item.sequence,
+                        signature=item.signature,
+                        rid=item.rid,
+                        page_hashes=item.page_hashes,
+                        start_page=item.start_page,
+                        num_pages=item.num_pages,
+                        local_restorable=(),
+                        common_pages=0,
+                        swa_window_pages=0,
+                        acquired=item.operation == _PrepareOperation.ACQUIRE,
+                        read_held=False,
+                        anchor_node=item.anchor_node,
+                        anchor_lock_params=item.anchor_lock_params,
+                    )
+                    for item in batch.items
+                ]
+                if batch.completion is None:
+                    self._prepare_results.put(results)
+                else:
+                    batch.results = results
+                    batch.completion.set()
             finally:
                 self._prepare_queue.task_done()
 
@@ -1025,8 +1020,6 @@ class UnifiedCacheLinkerWrapper:
                 if prepared.common_pages == 0:
                     self._release_anchor(prepared)
                 self._prepared_reads[prepared.request_id] = prepared
-                if prepared.acquired or prepared.common_pages == 0:
-                    self._acquire_requested_ids.discard(prepared.request_id)
 
     def prepare_ready(self, req: Req) -> bool:
         request_id = self.request_id(req.rid)
@@ -1063,11 +1056,52 @@ class UnifiedCacheLinkerWrapper:
         )
         if not matches:
             return False
-        if not self._pp_prefill_protocol:
-            return True
-        if prepared.acquired or prepared.common_pages == 0:
-            return True
-        return request_id not in self._acquire_requested_ids
+        return True
+
+    def _acquire_for_admission(
+        self, req: Req, prepared: _PreparedRead
+    ) -> _PreparedRead:
+        """Synchronously acquire H_lookup while preserving worker FIFO order."""
+        assert self._pp_prefill_protocol
+        (
+            page_hashes,
+            transfers,
+            swa_window_pages,
+            anchor_node,
+            anchor_lock_params,
+        ) = self._build_local_prepare_inputs(
+            req,
+            prepared.signature,
+            prepared.start_page,
+            prepared.common_pages,
+            _PrepareOperation.ACQUIRE,
+        )
+        item = _PrepareItem(
+            request_id=prepared.request_id,
+            sequence=prepared.sequence,
+            signature=prepared.signature,
+            operation=_PrepareOperation.ACQUIRE,
+            rid=req.rid,
+            page_hashes=page_hashes,
+            start_page=prepared.start_page,
+            num_pages=prepared.common_pages,
+            transfers=transfers,
+            swa_window_pages=swa_window_pages,
+            anchor_node=anchor_node,
+            anchor_lock_params=anchor_lock_params,
+        )
+        completion = threading.Event()
+        batch = _PrepareBatch([item], completion=completion)
+        self._prepare_queue.put(batch)
+        completion.wait()
+        assert batch.results is not None and len(batch.results) == 1
+        acquired = batch.results[0]
+
+        old = self._prepared_reads.pop(prepared.request_id, None)
+        if old is not None and old is not acquired:
+            self._discard_prepared(old)
+        self._prepared_reads[prepared.request_id] = acquired
+        return acquired
 
     # ---- phase 2: admission match requests/consumes an acquired boundary ----
 
@@ -1101,10 +1135,11 @@ class UnifiedCacheLinkerWrapper:
             return result
 
         if self._pp_prefill_protocol and not prepared.acquired:
-            # PP0 will publish this intent in the next scheduler control round;
-            # every rank then enters session_start in the same worker FIFO.
-            self._acquire_requested_ids.add(request_id)
-            return result
+            # Admission blocks on one acquire. Running it through the existing
+            # worker serializes this collective after all earlier lookups.
+            prepared = self._acquire_for_admission(req, prepared)
+            if prepared.common_pages <= 0:
+                return result
 
         page = self.cache.page_size
         prepared_start = prepared.start_page * page
@@ -1126,6 +1161,8 @@ class UnifiedCacheLinkerWrapper:
                     )
                 prepared.read_held = False
             self._release_anchor(prepared)
+            self._prepared_reads.pop(request_id, None)
+            self._rid_to_request_id.pop(req.rid, None)
             return result
         if not prepared.read_held:
             return result
@@ -1510,7 +1547,6 @@ class UnifiedCacheLinkerWrapper:
         self._rid_to_request_id.clear()
         self._released_prepare_sequences.clear()
         self._active_prepare_ids.clear()
-        self._acquire_requested_ids.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
         for node_id, lock_params in self.pending_loads.values():
@@ -1529,7 +1565,6 @@ class UnifiedCacheLinkerWrapper:
                 (request_id, pending[0])
             )
         getattr(self, "_active_prepare_ids", set()).discard(request_id)
-        getattr(self, "_acquire_requested_ids", set()).discard(request_id)
         prepared = getattr(self, "_prepared_reads", {}).pop(request_id, None)
         if prepared is not None:
             self._discard_prepared(prepared)
@@ -1545,7 +1580,6 @@ class UnifiedCacheLinkerWrapper:
         prepared = self._prepared_reads.pop(request_id, None)
         if prepared is not None:
             self._discard_prepared(prepared)
-        self._acquire_requested_ids.discard(request_id)
 
     def close(self) -> None:
         self.reset()
