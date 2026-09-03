@@ -55,6 +55,12 @@ class MatchPrefixParams:
     cow_mamba: bool = False
     req: Optional[Req] = None
 
+    # Direct-L3 linker specific.  Policy/probe matches leave this false; only
+    # the prefill scheduler's admission-time rematch may request a PP read
+    # session.  Keeping the phase on the match call preserves the normal
+    # match_prefix -> linker.match chain without giving every probe side effects.
+    linker_prefill_admission: bool = False
+
 
 @dataclasses.dataclass
 class InsertParams:

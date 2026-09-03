@@ -26,6 +26,7 @@ import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
+from enum import IntEnum
 from queue import Empty, Queue
 from typing import TYPE_CHECKING, Any, NamedTuple
 
@@ -149,9 +150,17 @@ class ExternalCacheHitMarker(NamedTuple):
     device_hit_len: int
 
 
+class _PrepareOperation(IntEnum):
+    NONE = 0
+    LOOKUP = 1
+    ACQUIRE = 2
+
+
 @dataclass
 class _PreparedRead:
     request_id: int
+    sequence: int
+    signature: int
     rid: str | None
     page_hashes: tuple[str, ...] | None
     start_page: int
@@ -159,6 +168,7 @@ class _PreparedRead:
     local_restorable: tuple[int, ...]
     common_pages: int
     swa_window_pages: int
+    acquired: bool
     read_held: bool
     anchor_node: Any = None
     anchor_lock_params: DecLockRefParams | None = None
@@ -167,13 +177,15 @@ class _PreparedRead:
 @dataclass
 class _PrepareItem:
     request_id: int
+    sequence: int
+    signature: int
+    operation: _PrepareOperation
     rid: str | None
     page_hashes: tuple[str, ...] | None
     start_page: int
     num_pages: int
     transfers: list[PoolTransfer] | None
     swa_window_pages: int = 0
-    reuse: _PreparedRead | None = None
     anchor_node: Any = None
     anchor_lock_params: DecLockRefParams | None = None
 
@@ -420,17 +432,20 @@ class UnifiedCacheLinkerWrapper:
         # Offloads in flight, each holding a lock on its node until it lands.
         self.pending_offloads: list[tuple[NodeId, DecLockRefParams]] = []
 
-        # L3 reads are prepared outside the scheduler thread.  The scheduler
-        # publishes a PP0-canonical request window; this worker performs the
-        # backend query/acquire and intersects sparse boundaries on dedicated
-        # CPU groups.  ``match`` only reads the completed map below.
+        # L3 reads are prepared outside the scheduler thread. For PP prefill,
+        # waiting requests get a pure lookup first; only an admission-time
+        # match asks the same worker to acquire a per-rank read session. Both
+        # phases intersect sparse boundaries on dedicated CPU groups.
+        self._pp_prefill_protocol = cache.pp_size > 1
         self._prepare_pending: dict[
-            int, tuple[int, int, tuple[str, ...] | None]
+            int, tuple[int, _PrepareOperation, int, tuple[str, ...] | None]
         ] = {}
         self._prepared_reads: dict[int, _PreparedRead] = {}
         self._rid_to_request_id: dict[str, int] = {}
-        self._released_prepare_ids: set[int] = set()
+        self._released_prepare_sequences: set[tuple[int, int]] = set()
         self._active_prepare_ids: set[int] = set()
+        self._acquire_requested_ids: set[int] = set()
+        self._next_prepare_sequence = 1
         self._prepare_queue: Queue[_PrepareBatch | None] = Queue()
         self._prepare_results: Queue[list[_PreparedRead]] = Queue()
         self._prepare_sync_groups = self._create_prepare_sync_groups(params)
@@ -499,10 +514,11 @@ class UnifiedCacheLinkerWrapper:
         self._prepare_sync_groups = []
 
     def _all_reduce_prepare_groups(self, tensor: torch.Tensor, op) -> None:
+        assert tensor.device.type == "cpu"
         for group in self._prepare_sync_groups:
             torch.distributed.all_reduce(tensor, op=op, group=group)
 
-    # ---- phase 1: scheduler-window prepare (query/acquire + rank consensus) ----
+    # ---- phase 1: scheduler-window lookup, then admission-time acquire ----
 
     def _key_for_req(self, req: Req) -> RadixKey | None:
         if req.positional_embed_overrides is not None:
@@ -536,73 +552,115 @@ class UnifiedCacheLinkerWrapper:
         # UnifiedRadixCache.match_prefix, yielding a local radix snapshot only.
         return self.cache.match_prefix(MatchPrefixParams(key=key))
 
+    def _new_prepare_sequence(self) -> int:
+        sequence = self._next_prepare_sequence
+        self._next_prepare_sequence += 1
+        return sequence
+
     def build_prepare_manifest(
         self, requests: Sequence[Req], window_size: int
-    ) -> list[tuple[int, int, int, int, int]]:
-        """Build PP0's canonical active window and per-entry prepare flag."""
+    ) -> list[tuple[int, int, int, int, int, int]]:
+        """Build PP0's canonical window and its next background operation.
+
+        Records are ``(request_id, signature, sequence, start_page,
+        num_pages, operation)``.  PP prefill always looks up from page zero so
+        its result is an absolute logical boundary.  The old single-PP path
+        retains its L1-relative prepare behavior.
+        """
         manifest = []
         for req in requests[:window_size]:
             request_id = self.request_id(req.rid)
             key = self._key_for_req(req)
             full_page_hashes = self._full_page_hashes(key) if key is not None else ()
-            l1_match = self._match_l1(key) if key is not None else None
-            start_page = min(
-                (
-                    int(l1_match.device_indices.numel()) // self.cache.page_size
-                    if l1_match is not None
-                    else 0
-                ),
-                len(full_page_hashes),
-            )
+            if self._pp_prefill_protocol:
+                start_page = 0
+            else:
+                l1_match = self._match_l1(key) if key is not None else None
+                start_page = min(
+                    (
+                        int(l1_match.device_indices.numel()) // self.cache.page_size
+                        if l1_match is not None
+                        else 0
+                    ),
+                    len(full_page_hashes),
+                )
             page_hashes = full_page_hashes[start_page:]
+            signature = (
+                hash_str_to_int64(full_page_hashes[-1]) if full_page_hashes else 0
+            )
             if not page_hashes:
                 prepared = self._prepared_reads.pop(request_id, None)
                 if prepared is not None:
                     self._discard_prepared(prepared)
-                signature = (
-                    hash_str_to_int64(full_page_hashes[-1])
-                    if full_page_hashes
-                    else 0
-                )
-                manifest.append((request_id, signature, start_page, 0, 0))
+                self._acquire_requested_ids.discard(request_id)
+                manifest.append((request_id, signature, 0, start_page, 0, 0))
                 continue
-            signature = hash_str_to_int64(full_page_hashes[-1])
+
             prepared = self._prepared_reads.get(request_id)
             if (
                 prepared is not None
-                and prepared.start_page == start_page
-                and prepared.page_hashes == page_hashes
+                and (
+                    prepared.signature != signature
+                    or prepared.start_page != start_page
+                    or prepared.page_hashes
+                    != page_hashes[: prepared.num_pages]
+                )
             ):
-                manifest.append(
-                    (request_id, signature, start_page, len(page_hashes), 0)
-                )
-                continue
-            # A changed request with the same rid waits for its older FIFO
-            # collective to finish; queuing both would overlap one backend
-            # read ticket and make cancellation ambiguous.
-            if request_id in self._prepare_pending:
-                manifest.append(
-                    (request_id, signature, start_page, len(page_hashes), 0)
-                )
-                continue
-            if prepared is not None:
                 self._discard_prepared(prepared)
                 self._prepared_reads.pop(request_id, None)
+                self._acquire_requested_ids.discard(request_id)
+                prepared = None
+
+            pending = self._prepare_pending.get(request_id)
+            if pending is not None:
+                sequence = pending[0]
+                operation = _PrepareOperation.NONE
+                num_pages = len(page_hashes)
+            elif prepared is None:
+                sequence = self._new_prepare_sequence()
+                operation = (
+                    _PrepareOperation.LOOKUP
+                    if self._pp_prefill_protocol
+                    else _PrepareOperation.ACQUIRE
+                )
+                num_pages = len(page_hashes)
+            elif (
+                self._pp_prefill_protocol
+                and not prepared.acquired
+                and prepared.common_pages > 0
+                and request_id in self._acquire_requested_ids
+            ):
+                sequence = self._new_prepare_sequence()
+                operation = _PrepareOperation.ACQUIRE
+                # Revalidate and lock only the boundary agreed by lookup.
+                num_pages = prepared.common_pages
+            else:
+                sequence = prepared.sequence
+                operation = _PrepareOperation.NONE
+                num_pages = prepared.num_pages
+
             manifest.append(
-                (request_id, signature, start_page, len(page_hashes), 1)
+                (
+                    request_id,
+                    signature,
+                    sequence,
+                    start_page,
+                    num_pages,
+                    int(operation),
+                )
             )
         return manifest
 
     def reconcile_prepare_window(self, active_request_ids: set[int]) -> None:
-        """Drop leases outside PP0's current bounded admission window."""
+        """Drop speculative state outside PP0's bounded admission window."""
         self._active_prepare_ids = active_request_ids
-        self._released_prepare_ids.difference_update(active_request_ids)
         for request_id in list(self._prepared_reads):
             if request_id not in active_request_ids:
                 self._discard_prepared(self._prepared_reads.pop(request_id))
-        for request_id in self._prepare_pending:
+        for request_id, pending in self._prepare_pending.items():
             if request_id not in active_request_ids:
-                self._released_prepare_ids.add(request_id)
+                self._released_prepare_sequences.add((request_id, pending[0]))
+        self._acquire_requested_ids.intersection_update(active_request_ids)
         for rid, request_id in list(self._rid_to_request_id.items()):
             if request_id not in active_request_ids:
                 self._rid_to_request_id.pop(rid, None)
@@ -613,6 +671,7 @@ class UnifiedCacheLinkerWrapper:
         signature: int,
         start_page: int,
         num_pages: int,
+        operation: _PrepareOperation,
     ) -> tuple[
         tuple[str, ...] | None,
         list[PoolTransfer] | None,
@@ -628,24 +687,33 @@ class UnifiedCacheLinkerWrapper:
         try:
             key = self._key_for_req(req)
             full_hashes = self._full_page_hashes(key) if key is not None else ()
-            l1_match = self._match_l1(key) if key is not None else None
-            local_device_pages = (
-                int(l1_match.device_indices.numel()) // self.cache.page_size
-                if l1_match is not None
-                else 0
-            )
             if not (
                 full_hashes
                 and hash_str_to_int64(full_hashes[-1]) == signature
-                and len(full_hashes) == start_page + num_pages
-                and local_device_pages >= start_page
+                and start_page + num_pages <= len(full_hashes)
             ):
                 return (None, None, 0, None, None)
 
-            page_hashes = full_hashes[start_page:]
-            anchor_node = l1_match.last_device_node
-            lock_result = self.cache.inc_lock_ref(anchor_node)
-            anchor_lock_params = lock_result.to_dec_params()
+            # LOOKUP describes the whole currently matchable request. ACQUIRE
+            # may intentionally cover only the shorter H_lookup prefix.
+            if operation == _PrepareOperation.LOOKUP and (
+                start_page + num_pages != len(full_hashes)
+            ):
+                return (None, None, 0, None, None)
+
+            page_hashes = full_hashes[start_page : start_page + num_pages]
+            # The PP protocol deliberately holds no L1 node across the waiting
+            # window. Single-PP keeps the prior anchor behavior.
+            if not self._pp_prefill_protocol:
+                l1_match = self._match_l1(key)
+                local_device_pages = (
+                    int(l1_match.device_indices.numel()) // self.cache.page_size
+                )
+                if local_device_pages < start_page:
+                    return (None, None, 0, None, None)
+                anchor_node = l1_match.last_device_node
+                lock_result = self.cache.inc_lock_ref(anchor_node)
+                anchor_lock_params = lock_result.to_dec_params()
             lookup_transfers = []
             for component in self.cache._components_tuple:
                 transfer = component.build_external_linker_transfer(
@@ -687,20 +755,27 @@ class UnifiedCacheLinkerWrapper:
 
     def enqueue_prepare_manifest(
         self,
-        manifest: Sequence[tuple[int, int, int, int]],
+        manifest: Sequence[tuple[int, int, int, int, int, int]],
         local_requests: Sequence[Req],
     ) -> None:
         if not manifest:
             return
         by_id = {self.request_id(req.rid): req for req in local_requests}
         items = []
-        for request_id, signature, start_page, num_pages in manifest:
+        for (
+            request_id,
+            signature,
+            sequence,
+            start_page,
+            num_pages,
+            operation_value,
+        ) in manifest:
+            operation = _PrepareOperation(operation_value)
             req = by_id.get(request_id)
             rid = req.rid if req is not None else None
             page_hashes = None
             transfers = None
             swa_window_pages = 0
-            reuse = None
             anchor_node = None
             anchor_lock_params = None
 
@@ -712,25 +787,12 @@ class UnifiedCacheLinkerWrapper:
                     anchor_node,
                     anchor_lock_params,
                 ) = self._build_local_prepare_inputs(
-                    req, signature, start_page, num_pages
+                    req, signature, start_page, num_pages, operation
                 )
 
             prepared = self._prepared_reads.pop(request_id, None)
             if prepared is not None:
-                if (
-                    prepared.start_page == start_page
-                    and prepared.page_hashes == page_hashes
-                    and prepared.read_held
-                ):
-                    if anchor_node is not None:
-                        self.cache.dec_lock_ref(anchor_node, anchor_lock_params)
-                    reuse = prepared
-                    transfers = None
-                    swa_window_pages = prepared.swa_window_pages
-                    anchor_node = prepared.anchor_node
-                    anchor_lock_params = prepared.anchor_lock_params
-                else:
-                    self._discard_prepared(prepared)
+                self._discard_prepared(prepared)
 
             pending = self._prepare_pending.get(request_id)
             if pending is not None:
@@ -738,31 +800,32 @@ class UnifiedCacheLinkerWrapper:
                     "Duplicate linker prepare manifest entry while pending: request_id=%d",
                     request_id,
                 )
-                if reuse is None and anchor_node is not None:
+                if anchor_node is not None:
                     self.cache.dec_lock_ref(anchor_node, anchor_lock_params)
                     anchor_node = None
                     anchor_lock_params = None
-                if reuse is None:
-                    transfers = None
-                    page_hashes = None
+                transfers = None
+                page_hashes = None
             self._prepare_pending[request_id] = (
+                sequence,
+                operation,
                 signature,
-                start_page,
                 page_hashes,
             )
             if rid is not None:
                 self._rid_to_request_id[rid] = request_id
-                self._released_prepare_ids.discard(request_id)
             items.append(
                 _PrepareItem(
                     request_id=request_id,
+                    sequence=sequence,
+                    signature=signature,
+                    operation=operation,
                     rid=rid,
                     page_hashes=page_hashes,
                     start_page=start_page,
                     num_pages=num_pages,
                     transfers=transfers,
                     swa_window_pages=swa_window_pages,
-                    reuse=reuse,
                     anchor_node=anchor_node,
                     anchor_lock_params=anchor_lock_params,
                 )
@@ -779,26 +842,31 @@ class UnifiedCacheLinkerWrapper:
                 read_held = []
                 for item in batch.items:
                     held = False
-                    if item.reuse is not None:
-                        restorable = list(item.reuse.local_restorable)
-                        held = item.reuse.read_held
-                    elif item.rid is not None and item.transfers is not None:
+                    if item.rid is not None and item.transfers is not None:
                         try:
-                            restorable = self.cache_linker.prepare_read(
-                                item.rid, item.transfers
-                            )
-                            held = True
+                            if item.operation == _PrepareOperation.LOOKUP:
+                                restorable = self.cache_linker.lookup(
+                                    item.rid, item.transfers
+                                )
+                            else:
+                                restorable = self.cache_linker.prepare_read(
+                                    item.rid, item.transfers
+                                )
+                                held = True
                         except BaseException:
                             logger.exception(
-                                "External linker prepare failed: rid=%s", item.rid
+                                "External linker %s failed: rid=%s",
+                                item.operation.name.lower(),
+                                item.rid,
                             )
-                            try:
-                                self.cache_linker.release_read(item.rid)
-                            except BaseException:
-                                logger.exception(
-                                    "External linker prepare cleanup failed: rid=%s",
-                                    item.rid,
-                                )
+                            if item.operation == _PrepareOperation.ACQUIRE:
+                                try:
+                                    self.cache_linker.release_read(item.rid)
+                                except BaseException:
+                                    logger.exception(
+                                        "External linker acquire cleanup failed: rid=%s",
+                                        item.rid,
+                                    )
                             restorable = []
                     else:
                         restorable = []
@@ -811,6 +879,7 @@ class UnifiedCacheLinkerWrapper:
                     offsets.append(total)
                     total += item.num_pages + 1
                 mask = torch.zeros(total, dtype=torch.int, device="cpu")
+                assert mask.device.type == "cpu"
                 for item, offset, restorable in zip(
                     batch.items, offsets, local_restorable
                 ):
@@ -868,6 +937,8 @@ class UnifiedCacheLinkerWrapper:
                     results.append(
                         _PreparedRead(
                             request_id=item.request_id,
+                            sequence=item.sequence,
+                            signature=item.signature,
                             rid=item.rid,
                             page_hashes=item.page_hashes,
                             start_page=item.start_page,
@@ -882,6 +953,7 @@ class UnifiedCacheLinkerWrapper:
                             ),
                             common_pages=common_pages,
                             swa_window_pages=item.swa_window_pages,
+                            acquired=item.operation == _PrepareOperation.ACQUIRE,
                             read_held=held,
                             anchor_node=item.anchor_node,
                             anchor_lock_params=item.anchor_lock_params,
@@ -891,7 +963,10 @@ class UnifiedCacheLinkerWrapper:
             except BaseException:
                 logger.exception("External linker prepare batch failed")
                 for item in batch.items:
-                    if item.rid is not None:
+                    if (
+                        item.rid is not None
+                        and item.operation == _PrepareOperation.ACQUIRE
+                    ):
                         try:
                             self.cache_linker.release_read(item.rid)
                         except BaseException:
@@ -905,6 +980,8 @@ class UnifiedCacheLinkerWrapper:
                     [
                         _PreparedRead(
                             request_id=item.request_id,
+                            sequence=item.sequence,
+                            signature=item.signature,
                             rid=item.rid,
                             page_hashes=item.page_hashes,
                             start_page=item.start_page,
@@ -912,6 +989,7 @@ class UnifiedCacheLinkerWrapper:
                             local_restorable=(),
                             common_pages=0,
                             swa_window_pages=0,
+                            acquired=item.operation == _PrepareOperation.ACQUIRE,
                             read_held=False,
                             anchor_node=item.anchor_node,
                             anchor_lock_params=item.anchor_lock_params,
@@ -928,10 +1006,18 @@ class UnifiedCacheLinkerWrapper:
     def drain_prepares(self, finish_count: int) -> None:
         for _ in range(finish_count):
             for prepared in self._prepare_results.get():
-                self._prepare_pending.pop(prepared.request_id, None)
-                if prepared.request_id in self._released_prepare_ids:
+                pending = self._prepare_pending.get(prepared.request_id)
+                if pending is not None and pending[0] == prepared.sequence:
+                    self._prepare_pending.pop(prepared.request_id, None)
+                released_key = (prepared.request_id, prepared.sequence)
+                if (
+                    pending is None
+                    or pending[0] != prepared.sequence
+                    or released_key in self._released_prepare_sequences
+                    or prepared.request_id not in self._active_prepare_ids
+                ):
                     self._discard_prepared(prepared)
-                    self._released_prepare_ids.discard(prepared.request_id)
+                    self._released_prepare_sequences.discard(released_key)
                     continue
                 old = self._prepared_reads.pop(prepared.request_id, None)
                 if old is not None and old is not prepared:
@@ -939,6 +1025,8 @@ class UnifiedCacheLinkerWrapper:
                 if prepared.common_pages == 0:
                     self._release_anchor(prepared)
                 self._prepared_reads[prepared.request_id] = prepared
+                if prepared.acquired or prepared.common_pages == 0:
+                    self._acquire_requested_ids.discard(prepared.request_id)
 
     def prepare_ready(self, req: Req) -> bool:
         request_id = self.request_id(req.rid)
@@ -948,50 +1036,85 @@ class UnifiedCacheLinkerWrapper:
         page_hashes = self._full_page_hashes(key) if key is not None else ()
         if not page_hashes:
             return True
-        l1_match = self._match_l1(key)
-        if (
-            int(l1_match.device_indices.numel()) // self.cache.page_size
-            >= len(page_hashes)
-        ):
-            return True
+        if not self._pp_prefill_protocol:
+            l1_match = self._match_l1(key)
+            if (
+                int(l1_match.device_indices.numel()) // self.cache.page_size
+                >= len(page_hashes)
+            ):
+                return True
+        if request_id in self._prepare_pending:
+            return False
         prepared = self._prepared_reads.get(request_id)
         if (
             prepared is None
-            or prepared.start_page + prepared.num_pages != len(page_hashes)
+            or prepared.signature != hash_str_to_int64(page_hashes[-1])
+            or prepared.start_page + prepared.num_pages > len(page_hashes)
         ):
             return False
         # ``None`` is the safe PP fallback for a request missing locally while
         # the canonical manifest was prepared: it is ready as an L1-only miss.
-        return (
+        matches = (
             prepared.page_hashes is None
-            or prepared.page_hashes == page_hashes[prepared.start_page :]
+            or prepared.page_hashes
+            == page_hashes[
+                prepared.start_page : prepared.start_page + prepared.num_pages
+            ]
         )
+        if not matches:
+            return False
+        if not self._pp_prefill_protocol:
+            return True
+        if prepared.acquired or prepared.common_pages == 0:
+            return True
+        return request_id not in self._acquire_requested_ids
 
-    # ---- phase 2: network-free match consumes a completed prepare ----
+    # ---- phase 2: admission match requests/consumes an acquired boundary ----
 
-    def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
-        # A request may be matched several times while policy and admission are
-        # evaluated. Never let a marker from an older prepared signature survive
-        # a later L1-only/miss result.
+    def match(
+        self,
+        key: RadixKey,
+        req: Req,
+        result: MatchResult,
+        *,
+        prefill_admission: bool = False,
+    ) -> MatchResult:
+        request_id = self.request_id(req.rid)
+        if self._pp_prefill_protocol and not prefill_admission:
+            return result
+        # An admission request may be rematched after a previous attempt. Never
+        # let its older marker survive a later L1-only/miss result.
         self.hit_markers.pop(req.rid, None)
-        prepared = self._prepared_reads.get(self.request_id(req.rid))
+        prepared = self._prepared_reads.get(request_id)
         if prepared is None or prepared.common_pages <= 0:
             return result
         full_page_hashes = self._full_page_hashes(key)
         if not full_page_hashes:
             return result
         if (
-            prepared.page_hashes
+            prepared.signature != hash_str_to_int64(full_page_hashes[-1])
+            or prepared.page_hashes
             != full_page_hashes[
                 prepared.start_page : prepared.start_page + prepared.num_pages
             ]
         ):
             return result
 
+        if self._pp_prefill_protocol and not prepared.acquired:
+            # PP0 will publish this intent in the next scheduler control round;
+            # every rank then enters session_start in the same worker FIFO.
+            self._acquire_requested_ids.add(request_id)
+            return result
+
         page = self.cache.page_size
-        device_hit_len = int(result.device_indices.numel())
         prepared_start = prepared.start_page * page
         common_end = (prepared.start_page + prepared.common_pages) * page
+        if self._pp_prefill_protocol:
+            # H_session is the logical prefix boundary shared by every PP rank.
+            # Rematch all ranks at that cap: a longer incidental L1 hit must not
+            # consume past H, while a shorter one will load only its local gap.
+            result = self._match_l1(key[:common_end])
+        device_hit_len = int(result.device_indices.numel())
         if common_end <= device_hit_len:
             if prepared.read_held and prepared.rid is not None:
                 try:
@@ -1026,6 +1149,11 @@ class UnifiedCacheLinkerWrapper:
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
             swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
+            full_kv_hit_length=(
+                common_end
+                if self._pp_prefill_protocol
+                else result.full_kv_hit_length
+            ),
         )
 
     def _tail_hashes(
@@ -1365,8 +1493,8 @@ class UnifiedCacheLinkerWrapper:
             self._release_anchor(prepared)
 
     def reset(self) -> None:
-        for request_id in self._prepare_pending:
-            self._released_prepare_ids.add(request_id)
+        for request_id, pending in self._prepare_pending.items():
+            self._released_prepare_sequences.add((request_id, pending[0]))
         self._prepare_queue.join()
         while True:
             try:
@@ -1380,8 +1508,9 @@ class UnifiedCacheLinkerWrapper:
         self._prepare_pending.clear()
         self._prepared_reads.clear()
         self._rid_to_request_id.clear()
-        self._released_prepare_ids.clear()
+        self._released_prepare_sequences.clear()
         self._active_prepare_ids.clear()
+        self._acquire_requested_ids.clear()
         self.cache_linker.reset()
         self.hit_markers.clear()
         for node_id, lock_params in self.pending_loads.values():
@@ -1394,15 +1523,29 @@ class UnifiedCacheLinkerWrapper:
         request_id = getattr(self, "_rid_to_request_id", {}).pop(
             rid, self.request_id(rid)
         )
-        if request_id in getattr(self, "_prepare_pending", {}):
-            getattr(self, "_released_prepare_ids", set()).add(request_id)
+        pending = getattr(self, "_prepare_pending", {}).get(request_id)
+        if pending is not None:
+            getattr(self, "_released_prepare_sequences", set()).add(
+                (request_id, pending[0])
+            )
         getattr(self, "_active_prepare_ids", set()).discard(request_id)
+        getattr(self, "_acquire_requested_ids", set()).discard(request_id)
         prepared = getattr(self, "_prepared_reads", {}).pop(request_id, None)
         if prepared is not None:
             self._discard_prepared(prepared)
         if self.cache_linker.cancel_queued_load(rid):
             node_id, lock_params = self.pending_loads.pop(rid)
             self.cache.dec_lock_ref(node_id, lock_params)
+
+    def release_unadmitted(self, rid: str) -> None:
+        """Release an acquired ticket when admission rejects before load-back."""
+        if self.hit_markers.pop(rid, None) is None:
+            return
+        request_id = self._rid_to_request_id.pop(rid, self.request_id(rid))
+        prepared = self._prepared_reads.pop(request_id, None)
+        if prepared is not None:
+            self._discard_prepared(prepared)
+        self._acquire_requested_ids.discard(request_id)
 
     def close(self) -> None:
         self.reset()

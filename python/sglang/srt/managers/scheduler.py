@@ -3365,9 +3365,9 @@ class Scheduler(
         )
 
         if self.server_args.enable_unified_cache_external_linker:
-            # Keep Mooncake leases bounded to requests that admission can
-            # plausibly consume next. PP0 canonicalizes this window; prepare
-            # itself runs asynchronously and match_prefix remains network-free.
+            # PP0 canonicalizes a bounded lookup/acquire window.  With PP, the
+            # waiting phase only looks up H; session_start is requested later
+            # by the admission-time match and still runs on the CPU worker.
             linker_window = min(
                 max(1, self.get_num_allocatable_reqs(running_bs)),
                 self.tree_cache.linker_prepare_max_requests,
@@ -3437,7 +3437,19 @@ class Scheduler(
                 if loaded_tokens > 0:
                     req.storage_hit_length = loaded_tokens
 
-            req.init_next_round_input(self.tree_cache)
+            req.init_next_round_input(
+                self.tree_cache,
+                linker_prefill_admission=(self.tree_cache.pp_size > 1),
+            )
+            if (
+                self.server_args.enable_unified_cache_external_linker
+                and self.tree_cache.pp_size > 1
+                and not self.tree_cache.linker_prepare_ready(req)
+            ):
+                # This match changed LOOKUP_READY into ACQUIRE_PENDING. PP0
+                # publishes it on the next control round; do not admit until
+                # every rank has acquired and agreed on H_session.
+                continue
             if (
                 self.enable_hicache_storage
                 and self.server_args.hicache_host_memory_mode == "buffer_only"
@@ -3482,6 +3494,8 @@ class Scheduler(
                 # lifecycle and freeing them here causes double-free.
                 added = len(adder.can_run_list) > 0 and req is adder.can_run_list[-1]
                 if not added:
+                    if self.server_args.enable_unified_cache_external_linker:
+                        self.tree_cache.release_unadmitted_linker_read(req.rid)
                     # init_next_round_input() may stage deferred Mamba COW/clear
                     # metadata before add_one_req() rejects the request.
                     req.mamba_cow_src_index = None

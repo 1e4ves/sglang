@@ -1308,6 +1308,8 @@ class Req(ReqDllmMixin):
         self,
         tree_cache: Optional[BasePrefixCache] = None,
         cow_mamba: Optional[bool] = None,
+        *,
+        linker_prefill_admission: bool = False,
     ):
         if self.is_dllm():
             self._init_fill_ids_for_dllm()
@@ -1375,6 +1377,7 @@ class Req(ReqDllmMixin):
                     ),
                     req=self,
                     cow_mamba=cow_mamba,
+                    linker_prefill_admission=linker_prefill_admission,
                 )
             )
             if envs.SGLANG_RADIX_FORCE_MISS.get():

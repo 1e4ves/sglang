@@ -350,7 +350,7 @@ class UnifiedRadixCache(BasePrefixCache):
     def prepare_linker_requests(
         self, requests: Sequence[Req], window_size: int
     ) -> None:
-        """Publish PP0's head window to the direct-linker prepare worker."""
+        """Publish PP0's head window to the direct-linker CPU worker."""
         if self.linker is None or window_size <= 0:
             return
         window_size = min(window_size, self.linker_prepare_max_requests)
@@ -365,20 +365,21 @@ class UnifiedRadixCache(BasePrefixCache):
             # fixed-shape PP message (avoids a count round trip followed by a
             # dynamically-sized payload round trip).
             payload = torch.zeros(
-                1 + self.linker_prepare_max_requests * 5,
+                1 + self.linker_prepare_max_requests * 6,
                 dtype=torch.int64,
                 device="cpu",
             )
+            assert payload.device.type == "cpu"
             if self.pp_rank == 0:
                 payload[0] = len(manifest)
                 if manifest:
-                    payload[1 : 1 + len(manifest) * 5].copy_(
+                    payload[1 : 1 + len(manifest) * 6].copy_(
                         torch.tensor(manifest, dtype=torch.int64).reshape(-1)
                     )
             self._pp_sync(payload)
             manifest_count = int(payload[0].item())
             if manifest_count:
-                flat = payload[1 : 1 + manifest_count * 5]
+                flat = payload[1 : 1 + manifest_count * 6]
                 manifest = [
                     (
                         int(flat[index]),
@@ -386,18 +387,23 @@ class UnifiedRadixCache(BasePrefixCache):
                         int(flat[index + 2]),
                         int(flat[index + 3]),
                         int(flat[index + 4]),
+                        int(flat[index + 5]),
                     )
-                    for index in range(0, flat.numel(), 5)
+                    for index in range(0, flat.numel(), 6)
                 ]
             else:
                 manifest = []
         self.linker.reconcile_prepare_window({entry[0] for entry in manifest})
         self.linker.enqueue_prepare_manifest(
-            [entry[:4] for entry in manifest if entry[4]], requests
+            [entry for entry in manifest if entry[5]], requests
         )
 
     def linker_prepare_ready(self, req: Req) -> bool:
         return self.linker is None or self.linker.prepare_ready(req)
+
+    def release_unadmitted_linker_read(self, rid: str) -> None:
+        if self.linker is not None:
+            self.linker.release_unadmitted(rid)
 
     def reset(self) -> None:
         if self.linker is not None:
@@ -579,7 +585,12 @@ class UnifiedRadixCache(BasePrefixCache):
         # Finalizers must not emit actions; the walk's were applied above.
         assert not result.cache_actions
         if self.linker is not None and params.req is not None:
-            result = self.linker.match(params.key, params.req, result)
+            result = self.linker.match(
+                params.key,
+                params.req,
+                result,
+                prefill_admission=params.linker_prefill_admission,
+            )
         return result
 
     def is_chunk_cache(self) -> bool:
