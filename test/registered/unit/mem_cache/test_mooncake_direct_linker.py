@@ -34,9 +34,11 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     DevicePoolEntry,
     DevicePoolGroup,
     UnifiedCacheLinkerWrapper,
+    _PrepareOperation,
     _PreparedRead,
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+from sglang.srt.mem_cache.utils import hash_str_to_int64
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=1, suite="base-a-test-cpu")
@@ -208,6 +210,7 @@ def test_match_consumes_prepared_result_without_backend_lookup():
     wrapper.cache_linker = SimpleNamespace(
         release_read=lambda rid: released.append(rid)
     )
+    wrapper._pp_prefill_protocol = False
     wrapper.hit_markers = {}
     key = RadixKey(array("q", [1, 2, 3, 4]))
     hashes = wrapper._full_page_hashes(key)
@@ -215,6 +218,8 @@ def test_match_consumes_prepared_result_without_backend_lookup():
     wrapper._prepared_reads = {
         request_id: _PreparedRead(
             request_id=request_id,
+            sequence=2,
+            signature=hash_str_to_int64(hashes[-1]),
             rid="rid",
             page_hashes=hashes[1:],
             start_page=1,
@@ -222,9 +227,11 @@ def test_match_consumes_prepared_result_without_backend_lookup():
             local_restorable=(1, 2),
             common_pages=2,
             swa_window_pages=0,
+            acquired=True,
             read_held=True,
         )
     }
+    wrapper._rid_to_request_id = {"rid": request_id}
     node = object()
     result = MatchResult(
         device_indices=torch.tensor([7]),
@@ -233,11 +240,80 @@ def test_match_consumes_prepared_result_without_backend_lookup():
         best_match_node=node,
     )
 
-    matched = wrapper.match(key, SimpleNamespace(rid="rid"), result)
+    matched = wrapper.match(
+        key,
+        SimpleNamespace(rid="rid"),
+        result,
+        prefill_admission=True,
+    )
 
     assert matched.host_hit_length == 2
     assert wrapper.hit_markers["rid"].tail_hashes == list(hashes[1:3])
     assert released == []
+
+
+def test_pp_lookup_is_pure_until_admission_requests_acquire():
+    wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+    wrapper.cache = SimpleNamespace(
+        page_size=1,
+        pp_size=2,
+        swa_reprefill_tail_tokens=lambda: 0,
+    )
+    wrapper.cache_linker = SimpleNamespace(release_read=lambda rid: None)
+    wrapper._pp_prefill_protocol = True
+    wrapper._prepare_pending = {}
+    wrapper._prepared_reads = {}
+    wrapper._acquire_requested_ids = set()
+    wrapper._next_prepare_sequence = 1
+    wrapper.hit_markers = {}
+    req = SimpleNamespace(
+        rid="rid",
+        positional_embed_overrides=None,
+        origin_input_ids=array("q", [1, 2, 3, 4]),
+        output_ids=[],
+        extra_key=None,
+        cache_salt=None,
+        _compute_max_prefix_len=lambda length: length,
+    )
+
+    lookup = wrapper.build_prepare_manifest([req], 1)[0]
+    assert lookup[-1] == _PrepareOperation.LOOKUP
+    assert lookup[3:5] == (0, 4)
+
+    key = wrapper._key_for_req(req)
+    hashes = wrapper._full_page_hashes(key)
+    request_id = wrapper.request_id(req.rid)
+    wrapper._prepared_reads[request_id] = _PreparedRead(
+        request_id=request_id,
+        sequence=lookup[2],
+        signature=lookup[1],
+        rid=req.rid,
+        page_hashes=hashes,
+        start_page=0,
+        num_pages=len(hashes),
+        local_restorable=(1, 2, 3),
+        common_pages=3,
+        swa_window_pages=0,
+        acquired=False,
+        read_held=False,
+    )
+    node = object()
+    result = MatchResult(
+        device_indices=torch.tensor([], dtype=torch.int64),
+        last_device_node=node,
+        last_host_node=node,
+        best_match_node=node,
+    )
+
+    wrapper.match(key, req, result, prefill_admission=False)
+    assert request_id not in wrapper._acquire_requested_ids
+    wrapper.match(key, req, result, prefill_admission=True)
+    assert request_id in wrapper._acquire_requested_ids
+
+    acquire = wrapper.build_prepare_manifest([req], 1)[0]
+    assert acquire[-1] == _PrepareOperation.ACQUIRE
+    assert acquire[3:5] == (0, 3)
+    assert acquire[2] > lookup[2]
 
 
 def test_tail_hashes_honor_radix_key_limit():
